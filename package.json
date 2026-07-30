@@ -1,0 +1,91 @@
+{
+  "name": "tokencat",
+  "version": "0.27.0",
+  "description": "Claude와 Codex 사용량을 한눈에 보는 Windows 데스크톱 위젯",
+  "private": true,
+  "main": "electron/main.cjs",
+  "author": "TokenCat",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jongcoding/TokenCat.git"
+  },
+  "homepage": "https://github.com/jongcoding/TokenCat#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:ui\" \"npm:dev:desktop\"",
+    "dev:ui": "vite --host 127.0.0.1 --port 5173",
+    "dev:desktop": "wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "build": "tsc --noEmit && vite build",
+    "desktop": "electron .",
+    "test": "node --test tests/*.test.cjs",
+    "check:electron": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/integrations.cjs && node --check electron/updater.cjs",
+    "dist:win": "npm run build && cross-env ELECTRON_BUILDER_CACHE=.electron-builder-cache electron-builder --win nsis --publish never",
+    "dist:portable": "npm run build && cross-env ELECTRON_BUILDER_CACHE=.electron-builder-cache electron-builder --win portable --publish never",
+    "release:win": "npm run build && cross-env ELECTRON_BUILDER_CACHE=.electron-builder-cache EP_DRAFT=true electron-builder --win nsis portable --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "concurrently": "9.2.1",
+    "cross-env": "10.1.0",
+    "electron": "39.2.7",
+    "electron-builder": "26.0.20",
+    "typescript": "5.9.3",
+    "vite": "8.0.13",
+    "wait-on": "9.0.1"
+  },
+  "build": {
+    "appId": "com.tokencat.desktop",
+    "productName": "TokenCat",
+    "asar": true,
+    "compression": "normal",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/tokencat-icon.png",
+      "package.json"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "jongcoding",
+        "repo": "TokenCat",
+        "releaseType": "draft"
+      }
+    ],
+    "win": {
+      "icon": "assets/tokencat-icon.png",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "artifactName": "TokenCat-Setup-${version}-Windows.${ext}"
+    },
+    "portable": {
+      "artifactName": "TokenCat-Portable-${version}-Windows.${ext}"
+    }
+  }
+}
