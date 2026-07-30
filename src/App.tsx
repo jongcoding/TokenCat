@@ -20,6 +20,18 @@ import {
   type UsageHeatmapDay,
   type UsageInsightsResult,
 } from "./usageInsights";
+import {
+  VERTICAL_MINIMAL_ENTER_WIDTH,
+  chooseActiveMinimalOrientationForSize,
+  chooseMinimalOrientationForSize,
+  shouldExitMinimalForSize,
+  type MinimalOrientation,
+} from "./minimalLayout";
+import {
+  ACCOUNT_STORAGE_KEY,
+  parseAccountStorage,
+  type AccountStorageStatus,
+} from "./accountBootstrap";
 
 type Provider = "Claude" | "Codex";
 type Filter = "all" | Provider;
@@ -36,7 +48,6 @@ type ColorRole = "accent" | "claude" | "codex" | "appBg" | "surface";
 type ViewMode = "rings" | "bars";
 type MinimalGraphMode = "ring" | "bar" | "none";
 type MinimalGraphPreference = "follow" | "none";
-type MinimalOrientation = "horizontal" | "medium" | "vertical";
 type LayoutMode =
   | "vertical"
   | "horizontal"
@@ -56,6 +67,7 @@ type AccountOrigin = "demo" | "manual" | "live";
 type AccountSyncState = "idle" | "waiting" | "stale" | "error";
 type AddAccountMode = "managed" | "manual";
 type TokenDisplayMode = "hidden" | "total" | "detail";
+type TransparencyMode = "whole-window" | "background-only";
 type DisplayScaleKey =
   | "widgetScale"
   | "graphScale"
@@ -225,11 +237,11 @@ const MAX_AUTO_MINIMAL_HEIGHT = 480;
 const DEFAULT_AUTO_MINIMAL_WIDTH = 420;
 const MIN_AUTO_MINIMAL_WIDTH = 360;
 const MAX_AUTO_MINIMAL_WIDTH = 640;
-const AUTO_MINIMAL_EXIT_HYSTERESIS = 20;
-// Keep this aligned with DEFAULT_MEDIUM_MINIMAL_WINDOW_WIDTH in Electron.
-// The medium profile cannot be dragged below 240 DIP, so reaching its edge
-// must switch profiles before the user can continue toward the narrow widget.
-const VERTICAL_MINIMAL_ENTER_WIDTH = 240;
+const RESPONSIVE_RESIZE_THROTTLE_MS = 90;
+const WIDGET_POINTER_WAKE_THROTTLE_MS = 180;
+const INTEGRATION_POLL_INTERVAL_MS = 60_000;
+const MIN_WINDOW_OPACITY = 60;
+const MAX_WINDOW_OPACITY = 100;
 const GRID_SINGLE_COLUMN_MEDIA = "(max-width: 650px)";
 const DEFAULT_WIDGET_SCALE = 100;
 const MIN_WIDGET_SCALE = 80;
@@ -461,56 +473,19 @@ function normalizeAutoMinimalWidth(value: unknown) {
   );
 }
 
-function chooseMinimalOrientationForSize(
-  size: { width: number; height: number },
-  widthThreshold: number,
-  heightThreshold: number,
-): MinimalOrientation {
-  if (size.width > 0 && size.width <= VERTICAL_MINIMAL_ENTER_WIDTH) {
-    return "vertical";
-  }
-  const widthSmall = size.width > 0 && size.width <= widthThreshold;
-  const heightSmall = size.height > 0 && size.height <= heightThreshold;
-  if (widthSmall && heightSmall) {
-    return size.width / widthThreshold <= size.height / heightThreshold
-      ? "medium"
-      : "horizontal";
-  }
-  return widthSmall ? "medium" : "horizontal";
+function normalizeWindowOpacity(value: unknown) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 100;
+  return Math.min(
+    MAX_WINDOW_OPACITY,
+    Math.max(MIN_WINDOW_OPACITY, Math.round(numeric)),
+  );
 }
 
-function chooseActiveMinimalOrientationForSize(
-  size: { width: number; height: number },
-  widthThreshold: number,
-  heightThreshold: number,
-  currentOrientation: MinimalOrientation,
-): MinimalOrientation {
-  const holdVerticalUntil =
-    VERTICAL_MINIMAL_ENTER_WIDTH + AUTO_MINIMAL_EXIT_HYSTERESIS;
-  if (
-    size.width <= VERTICAL_MINIMAL_ENTER_WIDTH ||
-    (currentOrientation === "vertical" && size.width <= holdVerticalUntil)
-  ) {
-    return "vertical";
-  }
-
-  const widthExpanded =
-    size.width > widthThreshold + AUTO_MINIMAL_EXIT_HYSTERESIS;
-  const heightExpanded =
-    size.height > heightThreshold + AUTO_MINIMAL_EXIT_HYSTERESIS;
-  if (widthExpanded && !heightExpanded) return "horizontal";
-  if (!widthExpanded && heightExpanded) return "medium";
-
-  // Once the narrow profile has cleared its release boundary, do not strand
-  // it at a wide size. Re-evaluate which of the remaining layouts fits best.
-  if (currentOrientation === "vertical") {
-    return chooseMinimalOrientationForSize(
-      size,
-      widthThreshold,
-      heightThreshold,
-    );
-  }
-  return currentOrientation;
+function normalizeTransparencyMode(value: unknown): TransparencyMode {
+  return value === "background-only"
+    ? "background-only"
+    : "whole-window";
 }
 
 function readCardSurfaceMode(): CardSurfaceMode {
@@ -785,44 +760,35 @@ const QUOTA_LABELS: Record<QuotaKey, string> = {
   weekly: "주간",
 };
 
-const DEFAULT_ACCOUNTS: Account[] = [
-  {
-    id: "claude-work",
-    provider: "Claude",
-    name: "Claude · 업무용",
-    plan: "Max",
-    quotas: {
-      fiveHour: { used: 78, reset: "2시간 14분 후", visible: true },
-      weekly: { used: 43, reset: "월요일 오전 9시", visible: true },
+const MIGRATION_QUOTA_FALLBACKS: Record<
+  Provider,
+  Record<QuotaKey, Quota>
+> = {
+  Claude: {
+    fiveHour: {
+      used: 0,
+      reset: "직접 입력",
+      visible: true,
     },
-    iconMode: "default",
-    origin: "demo",
-  },
-  {
-    id: "codex-personal",
-    provider: "Codex",
-    name: "Codex · 개인용",
-    plan: "Plus",
-    quotas: {
-      fiveHour: { used: 54, reset: "3시간 5분 후", visible: false },
-      weekly: { used: 31, reset: "월요일 오전 9시", visible: true },
+    weekly: {
+      used: 0,
+      reset: "직접 입력",
+      visible: true,
     },
-    iconMode: "default",
-    origin: "demo",
   },
-  {
-    id: "claude-side",
-    provider: "Claude",
-    name: "Claude · 사이드",
-    plan: "Pro",
-    quotas: {
-      fiveHour: { used: 34, reset: "4시간 2분 후", visible: true },
-      weekly: { used: 62, reset: "월요일 오전 9시", visible: true },
+  Codex: {
+    fiveHour: {
+      used: 0,
+      reset: "직접 입력",
+      visible: false,
     },
-    iconMode: "default",
-    origin: "demo",
+    weekly: {
+      used: 0,
+      reset: "직접 입력",
+      visible: true,
+    },
   },
-];
+};
 
 const DEFAULT_PROVIDER_ICONS: ProviderIcons = {
   Claude: "pet",
@@ -861,7 +827,7 @@ const EMPTY_UPDATE_STATE: AppUpdateState = {
   status: "disabled",
   distribution: "development",
   supported: false,
-  currentVersion: "0.27.0",
+  currentVersion: "0.30.0",
   availableVersion: null,
   progressPercent: null,
   transferred: null,
@@ -1382,6 +1348,25 @@ function managedAccountId(snapshot: IntegrationSnapshot) {
     : null;
 }
 
+function integrationSnapshotKey(snapshot: IntegrationSnapshot) {
+  const accountId = managedAccountId(snapshot);
+  return accountId
+    ? `managed:${snapshot.provider}:${accountId}`
+    : `system:${snapshot.provider}`;
+}
+
+function integrationSnapshotSignature(snapshot: IntegrationSnapshot) {
+  const {
+    lastUpdatedAt,
+    authVerifiedAt: _authVerifiedAt,
+    ...content
+  } = snapshot;
+  return JSON.stringify({
+    ...content,
+    observationDay: lastUpdatedAt?.slice(0, 10) ?? null,
+  });
+}
+
 function managedAccountIdFromConnection(connectionId?: string) {
   const prefix = "managed-";
   return connectionId?.startsWith(prefix)
@@ -1637,49 +1622,83 @@ function accountFromIntegration(
 }
 
 function normalizeQuota(
-  quota: Partial<Quota> | undefined,
+  quota: unknown,
   fallback: Quota,
   defaultVisible: boolean,
 ): Quota {
+  const candidate =
+    quota !== null && typeof quota === "object" && !Array.isArray(quota)
+      ? (quota as Partial<Quota>)
+      : undefined;
   return {
-    used: clampPercentage(quota?.used ?? fallback.used),
-    reset: quota?.reset || fallback.reset,
+    used: clampPercentage(candidate?.used ?? fallback.used),
+    reset:
+      typeof candidate?.reset === "string" && candidate.reset.trim()
+        ? candidate.reset
+        : fallback.reset,
     resetsAt:
-      typeof quota?.resetsAt === "string" || quota?.resetsAt === null
-        ? quota.resetsAt
+      typeof candidate?.resetsAt === "string" ||
+      candidate?.resetsAt === null
+        ? candidate.resetsAt
         : fallback.resetsAt,
-    visible: quota?.visible ?? defaultVisible,
+    visible:
+      typeof candidate?.visible === "boolean"
+        ? candidate.visible
+        : defaultVisible,
   };
 }
 
 function migrateAccounts(value: unknown): Account[] {
-  if (!Array.isArray(value)) return DEFAULT_ACCOUNTS;
+  if (!Array.isArray(value)) return [];
   if (!value.length) return [];
 
-  return value.map((raw, index) => {
+  return value.flatMap((raw, index) => {
+    if (
+      raw === null ||
+      typeof raw !== "object" ||
+      Array.isArray(raw) ||
+      ((raw as { provider?: unknown }).provider !== "Claude" &&
+        (raw as { provider?: unknown }).provider !== "Codex")
+    ) {
+      return [];
+    }
     const legacy = raw as Partial<Account> & {
       usage?: number;
       reset?: string;
       quotas?: Partial<Record<QuotaKey, Partial<Quota>>>;
     };
-    const provider: Provider = legacy.provider === "Codex" ? "Codex" : "Claude";
-    const fallback =
-      DEFAULT_ACCOUNTS.find((account) => account.provider === provider) ??
-      DEFAULT_ACCOUNTS[0];
-    const legacyUsage = clampPercentage(legacy.usage ?? fallback.quotas.weekly.used);
+    const provider = (raw as { provider: Provider }).provider;
+    const fallback = MIGRATION_QUOTA_FALLBACKS[provider];
+    const legacyUsage = clampPercentage(
+      legacy.usage ?? fallback.weekly.used,
+    );
+    const iconMode: AccountIconMode =
+      legacy.iconMode === "default" ||
+      legacy.iconMode === "pet" ||
+      legacy.iconMode === "initial" ||
+      legacy.iconMode === "none" ||
+      legacy.iconMode === "custom"
+        ? legacy.iconMode
+        : "default";
 
-    return {
-      id: legacy.id ?? `${provider.toLowerCase()}-${index}`,
+    return [{
+      id:
+        typeof legacy.id === "string" && legacy.id.trim()
+          ? legacy.id
+          : `${provider.toLowerCase()}-${index}`,
       provider,
-      name: legacy.name ?? `${provider} 계정`,
-      plan: legacy.plan ?? "구독",
+      name:
+        typeof legacy.name === "string"
+          ? legacy.name
+          : `${provider} 계정`,
+      plan: typeof legacy.plan === "string" ? legacy.plan : "구독",
       quotas: {
         fiveHour: normalizeQuota(
           legacy.quotas?.fiveHour ??
             (legacy.usage !== undefined
               ? { used: legacyUsage, reset: legacy.reset }
               : undefined),
-          fallback.quotas.fiveHour,
+          fallback.fiveHour,
           provider === "Claude",
         ),
         weekly: normalizeQuota(
@@ -1687,36 +1706,56 @@ function migrateAccounts(value: unknown): Account[] {
             (legacy.usage !== undefined
               ? { used: Math.round(legacyUsage * 0.7), reset: "직접 입력" }
               : undefined),
-          fallback.quotas.weekly,
+          fallback.weekly,
           true,
         ),
       },
-      iconMode: legacy.iconMode ?? "default",
-      customIcon: legacy.customIcon,
+      iconMode,
+      customIcon:
+        typeof legacy.customIcon === "string"
+          ? legacy.customIcon
+          : undefined,
       origin:
-        legacy.origin === "live" || legacy.origin === "manual"
+        legacy.origin === "live" ||
+        legacy.origin === "manual" ||
+        legacy.origin === "demo"
           ? legacy.origin
-          : "demo",
-      connectionId: legacy.connectionId,
+          : "manual",
+      connectionId:
+        typeof legacy.connectionId === "string"
+          ? legacy.connectionId
+          : undefined,
       syncState:
         legacy.syncState === "waiting" ||
         legacy.syncState === "stale" ||
         legacy.syncState === "error"
           ? legacy.syncState
           : "idle",
-      lastSyncedAt: legacy.lastSyncedAt,
+      lastSyncedAt:
+        typeof legacy.lastSyncedAt === "string"
+          ? legacy.lastSyncedAt
+          : undefined,
       contextTokens: normalizeContextTokens(legacy.contextTokens),
-    };
+    }];
   });
 }
 
-function readAccounts() {
-  try {
-    const stored = window.localStorage.getItem("tokencat-desktop-accounts");
-    return stored ? migrateAccounts(JSON.parse(stored)) : DEFAULT_ACCOUNTS;
-  } catch {
-    return DEFAULT_ACCOUNTS;
-  }
+type AccountBootstrap = {
+  status: AccountStorageStatus;
+  accounts: Account[];
+  shouldStartOnboarding: boolean;
+};
+
+function readAccountBootstrap(): AccountBootstrap {
+  const parsed = parseAccountStorage(
+    window.localStorage.getItem(ACCOUNT_STORAGE_KEY),
+  );
+  return {
+    status: parsed.status,
+    accounts:
+      parsed.status === "valid" ? migrateAccounts(parsed.accounts) : [],
+    shouldStartOnboarding: parsed.shouldStartOnboarding,
+  };
 }
 
 function readProviderIcons(): ProviderIcons {
@@ -1903,16 +1942,19 @@ function PetAvatar({
             "Official Claude Clawd pet",
           )}
         >
-          <img
-            className="pet-media pet-media--idle"
-            src={CLAUDE_PET_IDLE}
-            alt=""
-          />
-          <img
-            className="pet-media pet-media--active"
-            src={CLAUDE_PET_ACTIVE}
-            alt=""
-          />
+          {working && motion ? (
+            <img
+              className="pet-media pet-media--active"
+              src={CLAUDE_PET_ACTIVE}
+              alt=""
+            />
+          ) : (
+            <img
+              className="pet-media pet-media--idle"
+              src={CLAUDE_PET_IDLE}
+              alt=""
+            />
+          )}
           <i aria-hidden="true" />
         </span>
       );
@@ -1928,16 +1970,19 @@ function PetAvatar({
           "Official Codex companion pet",
         )}
       >
-        <img
-          className="pet-media pet-media--idle"
-          src={CODEX_PET_IDLE}
-          alt=""
-        />
-        <img
-          className="pet-media pet-media--active"
-          src={CODEX_PET_ACTIVE}
-          alt=""
-        />
+        {working && motion ? (
+          <img
+            className="pet-media pet-media--active"
+            src={CODEX_PET_ACTIVE}
+            alt=""
+          />
+        ) : (
+          <img
+            className="pet-media pet-media--idle"
+            src={CODEX_PET_IDLE}
+            alt=""
+          />
+        )}
         <i aria-hidden="true" />
       </span>
     );
@@ -2721,6 +2766,14 @@ function MinimalUsageStrip({
             className="minimal-strip"
             role="list"
             aria-label={t("계정별 사용량", "Usage by account")}
+            style={
+              {
+                "--minimal-account-count": Math.max(1, accounts.length),
+                "--minimal-account-basis": `${
+                  100 / Math.max(1, accounts.length)
+                }%`,
+              } as CSSProperties
+            }
           >
             {accounts.map((account) => {
               const quotas = visibleQuotas(account, language);
@@ -3366,7 +3419,12 @@ function App() {
       translate(language, korean, english),
     [language],
   );
-  const [accounts, setAccounts] = useState<Account[]>(readAccounts);
+  const [accountBootstrap] = useState<AccountBootstrap>(
+    readAccountBootstrap,
+  );
+  const [accounts, setAccounts] = useState<Account[]>(
+    accountBootstrap.accounts,
+  );
   const [usageHistory, setUsageHistory] = useState(() =>
     readUsageHistory(
       window.localStorage.getItem(HISTORY_STORAGE_KEY),
@@ -3510,9 +3568,16 @@ function App() {
   const [windowSizeBusy, setWindowSizeBusy] = useState<
     "lock" | "save" | "reset" | null
   >(null);
+  const [windowOpacity, setWindowOpacityState] = useState(100);
+  const [transparencyMode, setTransparencyMode] =
+    useState<TransparencyMode>("whole-window");
+  const [
+    backgroundOnlyTransparencySupported,
+    setBackgroundOnlyTransparencySupported,
+  ] = useState(true);
   const [openAtLogin, setOpenAtLogin] = useState(false);
   const [packaged, setPackaged] = useState(false);
-  const [version, setVersion] = useState("0.27.0");
+  const [version, setVersion] = useState("0.30.0");
   const [updateState, setUpdateState] =
     useState<AppUpdateState>(EMPTY_UPDATE_STATE);
   const [updateActionBusy, setUpdateActionBusy] = useState<
@@ -3560,7 +3625,10 @@ function App() {
   const manualIntegrationRefresh =
     useRef<Promise<IntegrationSnapshot[]> | null>(null);
   const integrationRefreshInFlight = useRef(false);
+  const integrationSnapshotSignaturesRef = useRef(new Map<string, string>());
   const managedMutationEpoch = useRef(0);
+  const lastWidgetPointerWakeRef = useRef(0);
+  const windowTransparencyRequestRef = useRef(0);
   const autoMinimalSuppressedRef = useRef(false);
   const pendingWindowModeTransitionRef = useRef<
     "manual" | "auto-resize"
@@ -3700,6 +3768,18 @@ function App() {
     wakeMinimalChromeFromWidget();
   }, [wakeMinimalChromeFromWidget, wakeTitlebarFromWidget]);
 
+  const wakeWidgetChromeFromPointer = useCallback(() => {
+    const now = window.performance.now();
+    if (
+      now - lastWidgetPointerWakeRef.current <
+      WIDGET_POINTER_WAKE_THROTTLE_MS
+    ) {
+      return;
+    }
+    lastWidgetPointerWakeRef.current = now;
+    wakeWidgetChrome();
+  }, [wakeWidgetChrome]);
+
   useEffect(() => {
     document.documentElement.lang = language;
     window.localStorage.setItem("tokencat-language", language);
@@ -3719,9 +3799,13 @@ function App() {
       "--claude",
       "--codex",
       "--app-bg",
+      "--app-bg-solid",
       "--surface",
+      "--surface-solid",
       "--surface-muted",
+      "--surface-muted-solid",
       "--surface-pressed",
+      "--surface-pressed-solid",
       "--line",
       "--line-strong",
       "--track",
@@ -3732,7 +3816,13 @@ function App() {
 
     COLOR_ROLES.forEach(({ role, cssVariable }) => {
       const value = overrides[role];
-      if (value) rootStyle.setProperty(cssVariable, value);
+      if (!value) return;
+      rootStyle.setProperty(cssVariable, value);
+      if (role === "appBg") {
+        rootStyle.setProperty("--app-bg-solid", value);
+      } else if (role === "surface") {
+        rootStyle.setProperty("--surface-solid", value);
+      }
     });
 
     if (overrides.accent) {
@@ -3745,14 +3835,26 @@ function App() {
     if (overrides.surface) {
       const textColor = THEME_TEXT_COLORS[theme];
       const darkTheme = isDarkTheme(theme);
+      const mutedSurface = mixHex(
+        overrides.surface,
+        textColor,
+        darkTheme ? 0.04 : 0.025,
+      );
+      const pressedSurface = mixHex(
+        overrides.surface,
+        textColor,
+        darkTheme ? 0.09 : 0.065,
+      );
       rootStyle.setProperty(
         "--surface-muted",
-        mixHex(overrides.surface, textColor, darkTheme ? 0.04 : 0.025),
+        mutedSurface,
       );
+      rootStyle.setProperty("--surface-muted-solid", mutedSurface);
       rootStyle.setProperty(
         "--surface-pressed",
-        mixHex(overrides.surface, textColor, darkTheme ? 0.09 : 0.065),
+        pressedSurface,
       );
+      rootStyle.setProperty("--surface-pressed-solid", pressedSurface);
       rootStyle.setProperty(
         "--line",
         mixHex(overrides.surface, textColor, darkTheme ? 0.12 : 0.1),
@@ -3795,11 +3897,44 @@ function App() {
   }, [percentageGraphPreferences]);
 
   useEffect(() => {
+    if (
+      accountBootstrap.status === "invalid" &&
+      accounts === accountBootstrap.accounts
+    ) {
+      return;
+    }
     window.localStorage.setItem(
-      "tokencat-desktop-accounts",
+      ACCOUNT_STORAGE_KEY,
       JSON.stringify(accounts),
     );
-  }, [accounts]);
+  }, [accountBootstrap, accounts]);
+
+  useEffect(() => {
+    if (
+      settingsWindowMode ||
+      !accountBootstrap.shouldStartOnboarding
+    ) {
+      return;
+    }
+    void window.tokenCat?.openOnboarding?.({ firstRun: true });
+  }, [
+    accountBootstrap.shouldStartOnboarding,
+    settingsWindowMode,
+  ]);
+
+  useEffect(() => {
+    if (
+      settingsWindowMode ||
+      !accounts.some(
+        (account) =>
+          account.origin === "manual" ||
+          (account.origin === "live" && account.syncState === "idle"),
+      )
+    ) {
+      return;
+    }
+    void window.tokenCat?.completeOnboarding?.();
+  }, [accounts, settingsWindowMode]);
 
   useEffect(() => {
     if (settingsWindowMode) return;
@@ -4181,6 +4316,15 @@ function App() {
         setOpenAtLogin(settings.openAtLogin);
         setVersion(settings.version);
         setPackaged(settings.packaged);
+        setWindowOpacityState(
+          normalizeWindowOpacity(settings.windowOpacity),
+        );
+        setTransparencyMode(
+          normalizeTransparencyMode(settings.transparencyMode),
+        );
+        setBackgroundOnlyTransparencySupported(
+          settings.backgroundOnlyTransparencySupported !== false,
+        );
         setWindowSizeState({
           sizeLocked: settings.sizeLocked,
           currentWindowSize: settings.currentWindowSize,
@@ -4211,10 +4355,16 @@ function App() {
       window.tokenCat?.onMaximizedChanged(setMaximized);
     const removeWindowSizeListener =
       window.tokenCat?.onWindowSizeStateChanged(setWindowSizeState);
+    const removeWindowTransparencyListener =
+      window.tokenCat?.onWindowTransparencyChanged?.((value) => {
+        setWindowOpacityState(normalizeWindowOpacity(value.opacity));
+        setTransparencyMode(normalizeTransparencyMode(value.mode));
+      });
     return () => {
       removePinListener?.();
       removeMaximizedListener?.();
       removeWindowSizeListener?.();
+      removeWindowTransparencyListener?.();
     };
   }, []);
 
@@ -4266,29 +4416,33 @@ function App() {
 
   useEffect(() => {
     if (!window.tokenCat || settingsWindowMode) return;
-    let resizeFrame: number | null = null;
-    const updateResponsiveWindowSize = () => {
-      if (resizeFrame !== null) return;
-      resizeFrame = window.requestAnimationFrame(() => {
-        resizeFrame = null;
-        const nextSize = {
-          width: Math.round(window.innerWidth),
-          height: Math.round(window.innerHeight),
-        };
-        setResponsiveWindowSize((current) =>
-          current.width === nextSize.width &&
-          current.height === nextSize.height
-            ? current
-            : nextSize,
-        );
-      });
+    let resizeTimer: number | null = null;
+    const commitResponsiveWindowSize = () => {
+      resizeTimer = null;
+      const nextSize = {
+        width: Math.round(window.innerWidth),
+        height: Math.round(window.innerHeight),
+      };
+      setResponsiveWindowSize((current) =>
+        current.width === nextSize.width &&
+        current.height === nextSize.height
+          ? current
+          : nextSize,
+      );
     };
-    updateResponsiveWindowSize();
+    const updateResponsiveWindowSize = () => {
+      if (resizeTimer !== null) return;
+      resizeTimer = window.setTimeout(
+        commitResponsiveWindowSize,
+        RESPONSIVE_RESIZE_THROTTLE_MS,
+      );
+    };
+    commitResponsiveWindowSize();
     window.addEventListener("resize", updateResponsiveWindowSize);
     return () => {
       window.removeEventListener("resize", updateResponsiveWindowSize);
-      if (resizeFrame !== null) {
-        window.cancelAnimationFrame(resizeFrame);
+      if (resizeTimer !== null) {
+        window.clearTimeout(resizeTimer);
       }
     };
   }, [settingsWindowMode]);
@@ -4491,18 +4645,39 @@ function App() {
   const applyIntegrationSnapshots = useCallback(
     (snapshots: IntegrationSnapshot[]) => {
       if (!snapshots.length) return;
+      if (
+        !settingsWindowMode &&
+        snapshots.some((snapshot) => snapshot.connected)
+      ) {
+        void window.tokenCat?.completeOnboarding?.();
+      }
+      const changedSnapshots = snapshots.filter((snapshot) => {
+        const key = integrationSnapshotKey(snapshot);
+        const signature = integrationSnapshotSignature(snapshot);
+        if (
+          integrationSnapshotSignaturesRef.current.get(key) === signature
+        ) {
+          return false;
+        }
+        integrationSnapshotSignaturesRef.current.set(key, signature);
+        return true;
+      });
+      if (!changedSnapshots.length) return;
 
       if (!settingsWindowMode) {
         setUsageHistory((current) => {
-          const recorded = recordUsageSnapshots(current, snapshots);
+          const recorded = recordUsageSnapshots(
+            current,
+            changedSnapshots,
+          );
           return recorded.changed ? recorded.history : current;
         });
       }
 
-      const systemSnapshots = snapshots.filter(
+      const systemSnapshots = changedSnapshots.filter(
         (snapshot) => !managedAccountId(snapshot),
       );
-      const managedSnapshots = snapshots.filter((snapshot) =>
+      const managedSnapshots = changedSnapshots.filter((snapshot) =>
         Boolean(managedAccountId(snapshot)),
       );
 
@@ -4688,50 +4863,62 @@ function App() {
     let cancelled = false;
 
     const updateInBackground = async () => {
-      const requests: Array<{
-        kind: "system" | "managed";
-        promise: Promise<IntegrationSnapshot[]>;
-        epoch?: number;
-      }> = [];
-      if (bridge.getIntegrationStatus) {
-        requests.push({
-          kind: "system",
-          promise: bridge.getIntegrationStatus(),
-        });
-      }
-      if (bridge.getManagedIntegrationStatus) {
-        requests.push({
-          kind: "managed",
-          promise: bridge.getManagedIntegrationStatus(),
-          epoch: managedMutationEpoch.current,
-        });
-      }
-      if (!requests.length) return;
-
-      const results = await Promise.allSettled(
-        requests.map((request) => request.promise),
-      );
-      if (cancelled) return;
-      const snapshots: IntegrationSnapshot[] = [];
-      results.forEach((result, index) => {
-        if (result.status !== "fulfilled") return;
-        snapshots.push(...result.value);
-        if (requests[index].kind === "managed") {
-          replaceManagedIntegrationSnapshots(
-            result.value,
-            requests[index].epoch,
-          );
-        } else {
-          applyIntegrationSnapshots(result.value);
+      if (cancelled || integrationRefreshInFlight.current) return;
+      integrationRefreshInFlight.current = true;
+      try {
+        const requests: Array<{
+          kind: "system" | "managed";
+          promise: Promise<IntegrationSnapshot[]>;
+          epoch?: number;
+        }> = [];
+        if (bridge.getIntegrationStatus) {
+          requests.push({
+            kind: "system",
+            promise: bridge.getIntegrationStatus(),
+          });
         }
-      });
-      if (snapshots.some((snapshot) => snapshot.connected)) {
-        setLastSync("방금 전");
+        if (bridge.getManagedIntegrationStatus) {
+          requests.push({
+            kind: "managed",
+            promise: bridge.getManagedIntegrationStatus(),
+            epoch: managedMutationEpoch.current,
+          });
+        }
+        if (!requests.length) return;
+
+        const results = await Promise.allSettled(
+          requests.map((request) => request.promise),
+        );
+        if (cancelled) return;
+        const snapshots: IntegrationSnapshot[] = [];
+        results.forEach((result, index) => {
+          if (result.status !== "fulfilled") return;
+          snapshots.push(...result.value);
+          if (requests[index].kind === "managed") {
+            replaceManagedIntegrationSnapshots(
+              result.value,
+              requests[index].epoch,
+            );
+          } else {
+            applyIntegrationSnapshots(result.value);
+          }
+        });
+        if (snapshots.some((snapshot) => snapshot.connected)) {
+          setLastSync("방금 전");
+        }
+      } finally {
+        integrationRefreshInFlight.current = false;
       }
     };
 
     const pollIntegrations = async () => {
-      if (cancelled || integrationRefreshInFlight.current) return;
+      if (
+        cancelled ||
+        document.hidden ||
+        integrationRefreshInFlight.current
+      ) {
+        return;
+      }
       const requests: Array<{
         kind: "system" | "managed";
         promise: Promise<IntegrationSnapshot[]>;
@@ -4791,14 +4978,24 @@ function App() {
       },
     );
 
-    void updateInBackground();
+    const refreshWhenVisible = () => {
+      if (document.hidden || cancelled) return;
+      void updateInBackground();
+    };
+
+    if (!document.hidden) void updateInBackground();
     const timer = window.setInterval(() => {
       void pollIntegrations();
-    }, 15_000);
+    }, INTEGRATION_POLL_INTERVAL_MS);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      document.removeEventListener(
+        "visibilitychange",
+        refreshWhenVisible,
+      );
       removeSnapshotListener?.();
     };
   }, [
@@ -4816,6 +5013,67 @@ function App() {
       setSyncing(false);
       petAnimationTimer.current = null;
     }, 2200);
+  };
+
+  const changeWindowTransparency = (
+    nextValue: Partial<{
+      mode: TransparencyMode;
+      opacity: number;
+    }>,
+  ) => {
+    const previous = {
+      mode: transparencyMode,
+      opacity: windowOpacity,
+    };
+    const next = {
+      mode: normalizeTransparencyMode(
+        nextValue.mode ?? transparencyMode,
+      ),
+      opacity: normalizeWindowOpacity(
+        nextValue.opacity ?? windowOpacity,
+      ),
+    };
+    const requestId = windowTransparencyRequestRef.current + 1;
+    windowTransparencyRequestRef.current = requestId;
+    setTransparencyMode(next.mode);
+    setWindowOpacityState(next.opacity);
+    const request = window.tokenCat?.setWindowTransparency?.(next);
+    if (!request) return;
+    void request
+      .then((applied) => {
+        if (
+          requestId === windowTransparencyRequestRef.current &&
+          applied
+        ) {
+          setTransparencyMode(normalizeTransparencyMode(applied.mode));
+          setWindowOpacityState(normalizeWindowOpacity(applied.opacity));
+        }
+      })
+      .catch(() => {
+        if (requestId !== windowTransparencyRequestRef.current) return;
+        setTransparencyMode(previous.mode);
+        setWindowOpacityState(previous.opacity);
+        setToast(
+          t(
+            "투명도 설정을 변경하지 못했습니다.",
+            "Could not change transparency settings.",
+          ),
+        );
+      });
+  };
+
+  const changeWindowOpacity = (value: number) => {
+    changeWindowTransparency({ opacity: value });
+  };
+
+  const changeTransparencyMode = (mode: TransparencyMode) => {
+    if (
+      mode === "background-only" &&
+      !backgroundOnlyTransparencySupported
+    ) {
+      return;
+    }
+    changeWindowTransparency({ mode });
   };
 
   const togglePinned = async () => {
@@ -4913,7 +5171,7 @@ function App() {
     pendingWindowModeTransitionRef.current =
       source === "auto" ? "auto-resize" : "manual";
     setMinimal(next);
-    setTitlebarHidden(false);
+    setTitlebarHidden(next && source === "auto");
     setToast(
       next
         ? source === "auto"
@@ -4924,7 +5182,7 @@ function App() {
               )
             : nextOrientation === "vertical"
               ? t(
-                  `창 폭이 ${VERTICAL_MINIMAL_ENTER_WIDTH}px 이하라 세로 미니멀 모드로 전환했습니다.`,
+                  `창 폭이 ${VERTICAL_MINIMAL_ENTER_WIDTH}px 미만이라 세로 미니멀 모드로 전환했습니다.`,
                   `Switched to vertical minimal mode below ${VERTICAL_MINIMAL_ENTER_WIDTH}px wide.`,
                 )
               : t(
@@ -4964,13 +5222,13 @@ function App() {
     if (!autoMinimal || windowSizeState.sizeLocked) return;
 
     if (minimal) {
-      const widthExpanded =
-        currentSize.width >
-        autoMinimalWidth + AUTO_MINIMAL_EXIT_HYSTERESIS;
-      const heightExpanded =
-        currentSize.height >
-        autoMinimalHeight + AUTO_MINIMAL_EXIT_HYSTERESIS;
-      if (widthExpanded && heightExpanded) {
+      if (
+        shouldExitMinimalForSize(
+          currentSize,
+          autoMinimalWidth,
+          autoMinimalHeight,
+        )
+      ) {
         changeMinimal(false, undefined, "auto");
         return;
       }
@@ -4988,11 +5246,11 @@ function App() {
     }
 
     if (autoMinimalSuppressedRef.current) {
-      const safelyExpanded =
-        currentSize.width >
-          autoMinimalWidth + AUTO_MINIMAL_EXIT_HYSTERESIS &&
-        currentSize.height >
-          autoMinimalHeight + AUTO_MINIMAL_EXIT_HYSTERESIS;
+      const safelyExpanded = shouldExitMinimalForSize(
+        currentSize,
+        autoMinimalWidth,
+        autoMinimalHeight,
+      );
       if (!safelyExpanded) return;
       autoMinimalSuppressedRef.current = false;
     }
@@ -6749,6 +7007,7 @@ function App() {
   const lastSyncDisplay =
     lastSync === "방금 전" ? t("방금 전", "just now") : lastSync;
   const dashboardFontVariables = {
+    "--window-background-opacity": `${windowOpacity}%`,
     "--dashboard-graph-scale": graphScale / 100,
     "--dashboard-profile-scale": profileScale / 100,
     "--dashboard-profile-size-min": scaledFontSize(
@@ -6842,13 +7101,26 @@ function App() {
     ),
   } as CSSProperties;
 
-  const openAddPanel = () => {
-    setAddProvider("Claude");
+  const openAddPanel = (provider: Provider = "Claude") => {
+    setAddProvider(provider);
     setAddMode(
       getManagedBridge()?.createManagedIntegration ? "managed" : "manual",
     );
     setAddOpen(true);
   };
+
+  useEffect(
+    () =>
+      window.tokenCat?.onOnboardingAccountRequested?.((provider) => {
+        if (settingsWindowMode) return;
+        setFilter("all");
+        setSettingsOpen(false);
+        setEditingId(null);
+        setPendingManagedRemoval(null);
+        openAddPanel(provider);
+      }),
+    [settingsWindowMode],
+  );
 
   const clearSelectedUsageHistory = () => {
     if (!insightsAccountKey || !insightsAccount) return;
@@ -6889,6 +7161,9 @@ function App() {
       className={[
         "desktop-app",
         settingsWindowMode ? "desktop-app--settings-window" : "",
+        !settingsWindowMode && transparencyMode === "background-only"
+          ? "desktop-app--transparency-background"
+          : "",
         `desktop-app--${viewMode}`,
         `desktop-app--view-${activeView}`,
         `desktop-app--layout-${layoutMode}`,
@@ -6915,7 +7190,7 @@ function App() {
         .filter(Boolean)
         .join(" ")}
       style={dashboardFontVariables}
-      onPointerMoveCapture={wakeWidgetChrome}
+      onPointerMoveCapture={wakeWidgetChromeFromPointer}
       onPointerDownCapture={wakeWidgetChrome}
       onWheelCapture={wakeWidgetChrome}
       onFocusCapture={wakeWidgetChrome}
@@ -7240,7 +7515,7 @@ function App() {
               </button>
               <button
                 type="button"
-                onClick={openAddPanel}
+                onClick={() => openAddPanel()}
                 title={t("계정 추가", "Add account")}
                 aria-label={t("계정 추가", "Add account")}
               >
@@ -7682,9 +7957,28 @@ function App() {
                 <strong>
                   {t("표시할 계정이 없습니다.", "No accounts to show.")}
                 </strong>
-                <button type="button" onClick={openAddPanel}>
-                  {t("계정 추가", "Add account")}
-                </button>
+                <span>
+                  {t(
+                    "실제 Claude 또는 Codex 계정을 연결하면 사용량이 여기에 표시됩니다.",
+                    "Connect a real Claude or Codex account to see usage here.",
+                  )}
+                </span>
+                <div className="empty-state__actions">
+                  <button type="button" onClick={() => openAddPanel()}>
+                    {t("계정 추가", "Add account")}
+                  </button>
+                  <button
+                    type="button"
+                    className="is-secondary"
+                    onClick={() =>
+                      void window.tokenCat?.openOnboarding?.({
+                        firstRun: false,
+                      })
+                    }
+                  >
+                    {t("시작 가이드", "Getting started")}
+                  </button>
+                </div>
               </div>
             )}
           </section>
@@ -7882,6 +8176,45 @@ function App() {
                   aria-pressed={language === "en"}
                 >
                   English
+                </button>
+              </div>
+            </div>
+
+            <div className="settings-section getting-started-settings settings-category settings-category--general">
+              <div className="settings-section__heading">
+                <strong>{t("시작 가이드", "Getting started")}</strong>
+                <span>
+                  {t(
+                    "계정 연결과 기본 사용법을 다시 확인합니다",
+                    "Review account connection and the basics",
+                  )}
+                </span>
+              </div>
+              <div className="getting-started-card">
+                <img src={TOKENCAT_PET} alt="" draggable={false} />
+                <div>
+                  <strong>
+                    {t(
+                      "처음부터 차근차근 보기",
+                      "Walk through TokenCat again",
+                    )}
+                  </strong>
+                  <small>
+                    {t(
+                      "별도 창에서 열리므로 현재 위젯 크기와 배치는 바뀌지 않습니다.",
+                      "It opens separately, so your current widget size and layout stay unchanged.",
+                    )}
+                  </small>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    void window.tokenCat?.openOnboarding?.({
+                      firstRun: false,
+                    })
+                  }
+                >
+                  {t("가이드 열기", "Open guide")}
                 </button>
               </div>
             </div>
@@ -8257,8 +8590,8 @@ function App() {
                     "Medium minimal width",
                   )}
                   description={t(
-                    `이 값 이하는 중간형, ${VERTICAL_MINIMAL_ENTER_WIDTH}px 이하는 세로형으로 정렬합니다`,
-                    `Uses medium below this width and vertical below ${VERTICAL_MINIMAL_ENTER_WIDTH}px`,
+                    `이 값 이하는 중간형, ${VERTICAL_MINIMAL_ENTER_WIDTH}px 미만은 세로형으로 정렬합니다`,
+                    `Uses medium at or below this width and vertical below ${VERTICAL_MINIMAL_ENTER_WIDTH}px`,
                   )}
                   value={autoMinimalWidth}
                   minimum={MIN_AUTO_MINIMAL_WIDTH}
@@ -9083,8 +9416,8 @@ function App() {
                   </strong>
                   <small>
                     {t(
-                      `높이 ${autoMinimalHeight}px 이하는 가로형, 폭 ${autoMinimalWidth}px 이하는 중간형, ${VERTICAL_MINIMAL_ENTER_WIDTH}px 이하는 세로형으로 전환합니다`,
-                      `Uses horizontal below ${autoMinimalHeight}px tall, medium below ${autoMinimalWidth}px wide, and vertical below ${VERTICAL_MINIMAL_ENTER_WIDTH}px`,
+                      `높이 ${autoMinimalHeight}px 이하는 가로형, 폭 ${autoMinimalWidth}px 이하는 중간형, ${VERTICAL_MINIMAL_ENTER_WIDTH}px 미만은 세로형으로 전환합니다`,
+                      `Uses horizontal at or below ${autoMinimalHeight}px tall, medium at or below ${autoMinimalWidth}px wide, and vertical below ${VERTICAL_MINIMAL_ENTER_WIDTH}px`,
                     )}
                   </small>
                 </div>
@@ -9381,6 +9714,90 @@ function App() {
                     {label}
                   </button>
                 ))}
+              </div>
+            </div>
+
+            <div className="settings-section settings-category settings-category--appearance">
+              <div className="settings-section__heading">
+                <strong>{t("투명 모드", "Transparency")}</strong>
+                <span>
+                  {t(
+                    "투명하게 만들 대상을 선택한 뒤 슬라이더로 정도를 조절합니다. 설정 창은 항상 선명하게 유지됩니다.",
+                    "Choose what becomes transparent, then adjust the amount. Settings always stays fully opaque.",
+                  )}
+                </span>
+              </div>
+              <div
+                className="transparency-mode-control"
+                role="group"
+                aria-label={t("투명 대상", "Transparency target")}
+              >
+                <button
+                  type="button"
+                  className={
+                    transparencyMode === "whole-window"
+                      ? "is-active"
+                      : ""
+                  }
+                  aria-pressed={transparencyMode === "whole-window"}
+                  onClick={() =>
+                    changeTransparencyMode("whole-window")
+                  }
+                >
+                  <strong>{t("전체 투명", "Whole widget")}</strong>
+                  <small>
+                    {t(
+                      "배경·그래프·숫자·캐릭터",
+                      "Background, graphs, numbers, and pets",
+                    )}
+                  </small>
+                </button>
+                <button
+                  type="button"
+                  className={
+                    transparencyMode === "background-only"
+                      ? "is-active"
+                      : ""
+                  }
+                  aria-pressed={transparencyMode === "background-only"}
+                  disabled={!backgroundOnlyTransparencySupported}
+                  onClick={() =>
+                    changeTransparencyMode("background-only")
+                  }
+                >
+                  <strong>{t("배경만 투명", "Background only")}</strong>
+                  <small>
+                    {backgroundOnlyTransparencySupported
+                      ? t(
+                          "그래프·숫자·캐릭터는 선명",
+                          "Graphs, numbers, and pets stay crisp",
+                        )
+                      : t(
+                          "Windows 11 22H2 이상 필요",
+                          "Requires Windows 11 22H2 or later",
+                        )}
+                  </small>
+                </button>
+              </div>
+              <div className="window-opacity-control">
+                <SizeRangeControl
+                  id="window-opacity"
+                  label={
+                    transparencyMode === "background-only"
+                      ? t("배경 불투명도", "Background opacity")
+                      : t("전체 불투명도", "Whole-widget opacity")
+                  }
+                  description={t(
+                    `왼쪽 ${MIN_WINDOW_OPACITY}%부터 오른쪽 100%까지 1% 단위로 조절합니다`,
+                    `Drag from ${MIN_WINDOW_OPACITY}% on the left to 100% on the right`,
+                  )}
+                  value={windowOpacity}
+                  minimum={MIN_WINDOW_OPACITY}
+                  maximum={MAX_WINDOW_OPACITY}
+                  unit="%"
+                  step={1}
+                  onChange={changeWindowOpacity}
+                />
               </div>
             </div>
 

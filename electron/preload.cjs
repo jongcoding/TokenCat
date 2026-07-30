@@ -4,8 +4,11 @@ const { contextBridge, ipcRenderer } = require("electron");
 /** @typedef {"general" | "dashboard" | "accounts" | "appearance"} SettingsCategory */
 
 const openSettingsListeners = new Set();
+const onboardingAccountRequestListeners = new Set();
 const updateStateListeners = new Set();
+const windowTransparencyListeners = new Set();
 let pendingOpenSettingsRequest = null;
+let pendingOnboardingAccountRequest = null;
 
 ipcRenderer.on(
   "app:open-settings",
@@ -37,6 +40,27 @@ ipcRenderer.on("updates:state-changed", (_event, snapshot) => {
   }
 });
 
+ipcRenderer.on("window:transparency-changed", (_event, value) => {
+  for (const listener of windowTransparencyListeners) {
+    listener(value);
+  }
+});
+
+ipcRenderer.on(
+  "app:onboarding-account-requested",
+  (_event, provider) => {
+    const normalizedProvider =
+      provider === "Codex" ? "Codex" : "Claude";
+    if (onboardingAccountRequestListeners.size === 0) {
+      pendingOnboardingAccountRequest = normalizedProvider;
+      return;
+    }
+    for (const listener of onboardingAccountRequestListeners) {
+      listener(normalizedProvider);
+    }
+  },
+);
+
 contextBridge.exposeInMainWorld("tokenCat", {
   minimize: () => ipcRenderer.send("window:minimize"),
   hide: () => ipcRenderer.send("window:hide"),
@@ -44,6 +68,12 @@ contextBridge.exposeInMainWorld("tokenCat", {
   openSettings: (category) =>
     ipcRenderer.invoke("app:open-settings-window", category),
   closeSettings: () => ipcRenderer.invoke("app:close-settings-window"),
+  openOnboarding: (options) =>
+    ipcRenderer.invoke("app:open-onboarding-window", options),
+  closeOnboarding: (result) =>
+    ipcRenderer.invoke("app:close-onboarding-window", result),
+  completeOnboarding: () =>
+    ipcRenderer.invoke("app:complete-onboarding-if-needed"),
   togglePin: () => ipcRenderer.invoke("window:toggle-pin"),
   toggleMaximize: () => ipcRenderer.invoke("window:toggle-maximize"),
   setWindowLayout: (
@@ -94,6 +124,8 @@ contextBridge.exposeInMainWorld("tokenCat", {
     ipcRenderer.invoke("window:save-current-size"),
   resetSavedWindowSize: () =>
     ipcRenderer.invoke("window:reset-saved-size"),
+  setWindowTransparency: (preferences) =>
+    ipcRenderer.invoke("window:set-transparency", preferences),
   getSettings: () => ipcRenderer.invoke("app:get-settings"),
   setLanguage: (language) =>
     ipcRenderer.invoke("app:set-language", language),
@@ -159,6 +191,10 @@ contextBridge.exposeInMainWorld("tokenCat", {
     return () =>
       ipcRenderer.removeListener("window:size-state-changed", listener);
   },
+  onWindowTransparencyChanged: (callback) => {
+    windowTransparencyListeners.add(callback);
+    return () => windowTransparencyListeners.delete(callback);
+  },
   onOpenSettings: (callback) => {
     openSettingsListeners.add(callback);
     if (pendingOpenSettingsRequest !== null) {
@@ -171,5 +207,20 @@ contextBridge.exposeInMainWorld("tokenCat", {
       });
     }
     return () => openSettingsListeners.delete(callback);
+  },
+  onOnboardingAccountRequested: (callback) => {
+    onboardingAccountRequestListeners.add(callback);
+    if (pendingOnboardingAccountRequest !== null) {
+      const provider = pendingOnboardingAccountRequest;
+      queueMicrotask(() => {
+        if (
+          !onboardingAccountRequestListeners.has(callback) ||
+          pendingOnboardingAccountRequest !== provider
+        ) return;
+        pendingOnboardingAccountRequest = null;
+        callback(provider);
+      });
+    }
+    return () => onboardingAccountRequestListeners.delete(callback);
   },
 });

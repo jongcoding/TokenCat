@@ -1,6 +1,6 @@
 {
   "name": "tokencat",
-  "version": "0.27.0",
+  "version": "0.30.0",
   "description": "Claude와 Codex 사용량을 한눈에 보는 Windows 데스크톱 위젯",
   "private": true,
   "main": "electron/main.cjs",
@@ -21,7 +21,7 @@
     "build": "tsc --noEmit && vite build",
     "desktop": "electron .",
     "test": "node --test tests/*.test.cjs",
-    "check:electron": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/integrations.cjs && node --check electron/updater.cjs",
+    "check:electron": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/onboarding-preload.cjs && node --check electron/integrations.cjs && node --check electron/minimal-window-constraints.cjs && node --check electron/onboarding.cjs && node --check electron/transparency.cjs && node --check electron/updater.cjs",
     "dist:win": "npm run build && cross-env ELECTRON_BUILDER_CACHE=.electron-builder-cache electron-builder --win nsis --publish never",
     "dist:portable": "npm run build && cross-env ELECTRON_BUILDER_CACHE=.electron-builder-cache electron-builder --win portable --publish never",
     "release:win": "npm run build && cross-env ELECTRON_BUILDER_CACHE=.electron-builder-cache EP_DRAFT=true electron-builder --win nsis portable --publish always"
@@ -48,7 +48,7 @@
     "appId": "com.tokencat.desktop",
     "productName": "TokenCat",
     "asar": true,
-    "compression": "normal",
+    "compression": "maximum",
     "directories": {
       "output": "release",
       "buildResources": "assets"

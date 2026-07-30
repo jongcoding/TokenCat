@@ -19,6 +19,72 @@ function fakeApp(userDataPath = path.join(os.tmpdir(), "tokencat-integration-tes
   };
 }
 
+test("status reads reuse recent CLI snapshots while explicit refresh stays fresh", async () => {
+  const temporaryRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "tokencat-status-cache-"),
+  );
+  const service = new IntegrationService(fakeApp(temporaryRoot));
+  let codexReads = 0;
+
+  try {
+    service.writeConnection("codex", true);
+    service.writeConnection("claude", false);
+    service.readCodexAccountAndRateLimits = async () => {
+      codexReads += 1;
+      return {
+        accountResult: {
+          account: {
+            type: "chatgpt",
+            planType: "plus",
+          },
+        },
+        rateLimitResult: {},
+      };
+    };
+
+    const first = await service.getStatus();
+    const second = await service.getStatus();
+
+    assert.equal(codexReads, 1);
+    assert.equal(first[0].connected, true);
+    assert.equal(second[0].connected, true);
+    assert.equal(first[0], second[0]);
+
+    await service.refreshConnectedProvider("codex");
+    assert.equal(codexReads, 2);
+  } finally {
+    service.shutdown();
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("integration caches stay bounded and are released on shutdown", () => {
+  const service = new IntegrationService(fakeApp());
+
+  for (let index = 0; index < 40; index += 1) {
+    service.cacheSnapshot({
+      provider: "claude",
+      accountId: `account-${index}`,
+    });
+  }
+  service.claudeUsageCache.set("usage", { usage: {}, expiresAt: Infinity });
+  service.claudeTranscriptCache.set("transcript", {
+    contextTokens: null,
+    expiresAt: Infinity,
+  });
+
+  assert.equal(service.snapshotCache.size, 26);
+  assert.equal(service.snapshotCache.has("managed:account-0"), false);
+  assert.equal(service.snapshotCache.has("managed:account-39"), true);
+
+  service.shutdown();
+
+  assert.equal(service.snapshotCache.size, 0);
+  assert.equal(service.claudeUsageCache.size, 0);
+  assert.equal(service.claudeTranscriptCache.size, 0);
+  assert.equal(service.snapshotListener, null);
+});
+
 test("refresh upgrades an existing TokenCat Claude bridge in place", async () => {
   const temporaryRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "tokencat-claude-upgrade-"),
