@@ -9,6 +9,11 @@ declare global {
     | "grid-3x3";
   type WindowCardSurfaceMode = "separate" | "unified";
   type MinimalOrientation = "horizontal" | "medium" | "vertical";
+  type WindowTransparencyMode = "whole-window" | "background-only";
+  interface WindowTransparencyPreferences {
+    mode: WindowTransparencyMode;
+    opacity: number;
+  }
   interface WindowSize {
     width: number;
     height: number;
@@ -99,6 +104,13 @@ declare global {
         category?: "general" | "dashboard" | "accounts" | "appearance",
       ) => Promise<boolean>;
       closeSettings: () => Promise<boolean>;
+      openOnboarding: (options?: {
+        firstRun?: boolean;
+      }) => Promise<boolean>;
+      closeOnboarding: (
+        result: "dismissed" | "completed",
+      ) => Promise<boolean>;
+      completeOnboarding: () => Promise<boolean>;
       togglePin: () => Promise<boolean>;
       toggleMaximize: () => Promise<boolean>;
       setWindowLayout: (
@@ -126,6 +138,9 @@ declare global {
       ) => Promise<WindowSizeState>;
       saveCurrentWindowSize: () => Promise<WindowSizeState>;
       resetSavedWindowSize: () => Promise<WindowSizeState>;
+      setWindowTransparency: (
+        preferences: WindowTransparencyPreferences,
+      ) => Promise<WindowTransparencyPreferences>;
       getSettings: () => Promise<WindowSizeState & {
         alwaysOnTop: boolean;
         maximized: boolean;
@@ -139,6 +154,9 @@ declare global {
         quotaOnly: boolean;
         widgetScale: number;
         cardSurfaceMode: WindowCardSurfaceMode;
+        windowOpacity: number;
+        transparencyMode: WindowTransparencyMode;
+        backgroundOnlyTransparencySupported: boolean;
         language: "ko" | "en";
       }>;
       setLanguage: (language: "ko" | "en") => Promise<"ko" | "en">;
@@ -193,11 +211,27 @@ declare global {
       onWindowSizeStateChanged: (
         callback: (value: WindowSizeState) => void,
       ) => () => void;
+      onWindowTransparencyChanged: (
+        callback: (value: WindowTransparencyPreferences) => void,
+      ) => () => void;
       onOpenSettings: (
         callback: (
           category: "general" | "dashboard" | "accounts" | "appearance",
         ) => void,
       ) => () => void;
+      onOnboardingAccountRequested: (
+        callback: (provider: "Claude" | "Codex") => void,
+      ) => () => void;
+    };
+    tokenCatOnboarding?: {
+      getInfo: () => Promise<{
+        version: string;
+        language: "ko" | "en";
+      }>;
+      close: (
+        result: "dismissed" | "completed",
+      ) => Promise<boolean>;
+      begin: (provider: "Claude" | "Codex") => Promise<boolean>;
     };
   }
 }

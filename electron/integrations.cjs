@@ -15,6 +15,7 @@ const CLAUDE_WATCH_DEBOUNCE_MS = 80;
 const CLAUDE_STATUSLINE_REFRESH_SECONDS = 30;
 const CLAUDE_USAGE_CACHE_MS = 45_000;
 const CLAUDE_AUTH_CACHE_MS = 15_000;
+const INTEGRATION_STATUS_CACHE_MS = 45_000;
 const CLAUDE_USAGE_RESPONSE_LIMIT_BYTES = 64 * 1024;
 const CLAUDE_CREDENTIALS_LIMIT_BYTES = 1024 * 1024;
 const CLAUDE_TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024;
@@ -25,6 +26,8 @@ const CLAUDE_USAGE_PATH = "/api/oauth/usage";
 const CLAUDE_USAGE_USER_AGENT = "claude-cli/2.1.220";
 const MANAGED_ACCOUNTS_FILE_NAME = "managed-accounts.json";
 const MANAGED_ACCOUNT_LIMIT = 12;
+const INTEGRATION_STATUS_CACHE_LIMIT =
+  MANAGED_ACCOUNT_LIMIT * 2 + PROVIDERS.size;
 const MANAGED_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const CLAUDE_LOGIN_POLL_MS = 900;
 const CLAUDE_LOGIN_EXIT_GRACE_MS = 5_000;
@@ -61,6 +64,16 @@ function connectingSnapshot(provider) {
     ...disconnectedSnapshot(provider),
     status: "connecting",
   };
+}
+
+function snapshotCacheKey(snapshot) {
+  const accountId =
+    typeof snapshot?.accountId === "string"
+      ? snapshot.accountId.trim()
+      : "";
+  return accountId
+    ? `managed:${accountId}`
+    : `system:${snapshot?.provider ?? "unknown"}`;
 }
 
 function integrationError(code) {
@@ -849,6 +862,7 @@ class IntegrationService {
     this.app = electronApp;
     this.activeChildren = new Set();
     this.refreshesInFlight = new Map();
+    this.snapshotCache = new Map();
     this.claudeUsageCache = new Map();
     this.claudeUsageRequests = new Map();
     this.claudeTranscriptCache = new Map();
@@ -922,7 +936,33 @@ class IntegrationService {
     this.openExternal = typeof listener === "function" ? listener : null;
   }
 
+  cacheSnapshot(snapshot) {
+    const key = snapshotCacheKey(snapshot);
+    this.snapshotCache.delete(key);
+    this.snapshotCache.set(key, {
+      snapshot,
+      cachedAt: Date.now(),
+    });
+    while (this.snapshotCache.size > INTEGRATION_STATUS_CACHE_LIMIT) {
+      const oldestKey = this.snapshotCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.snapshotCache.delete(oldestKey);
+    }
+    return snapshot;
+  }
+
+  cachedSnapshot(key) {
+    const cached = this.snapshotCache.get(key);
+    if (!cached) return null;
+    if (Date.now() - cached.cachedAt > INTEGRATION_STATUS_CACHE_MS) {
+      this.snapshotCache.delete(key);
+      return null;
+    }
+    return cached.snapshot;
+  }
+
   emitSnapshot(snapshot) {
+    this.cacheSnapshot(snapshot);
     try {
       this.snapshotListener?.(snapshot);
     } catch {
@@ -2275,44 +2315,48 @@ class IntegrationService {
       throw integrationError("MANAGED_ACCOUNT_NOT_FOUND");
     }
     if (this.managedLoginProcesses.has(account.id)) {
-      return connectingManagedSnapshot(account);
+      return this.cacheSnapshot(connectingManagedSnapshot(account));
     }
 
-    return this.deduplicateRefresh(`managed:${account.id}`, async () => {
-      try {
-        const profilePath = this.managedProfilePath(account);
-        const env = managedChildEnvironment(account.provider, profilePath);
-        if (account.provider === "codex") {
-          const { accountResult, rateLimitResult } =
-            await this.readCodexAccountAndRateLimits({
-              env,
-              managed: true,
-            });
+    const snapshot = await this.deduplicateRefresh(
+      `managed:${account.id}`,
+      async () => {
+        try {
+          const profilePath = this.managedProfilePath(account);
+          const env = managedChildEnvironment(account.provider, profilePath);
+          if (account.provider === "codex") {
+            const { accountResult, rateLimitResult } =
+              await this.readCodexAccountAndRateLimits({
+                env,
+                managed: true,
+              });
+            return withManagedIdentity(
+              normalizeCodexSnapshot(accountResult, rateLimitResult),
+              account,
+            );
+          }
+
+          this.ensureManagedClaudeBridge(account);
+          const auth = await this.readClaudeAuth({ env });
+          const usage = await this.collectClaudeUsageSnapshot(
+            auth,
+            this.readManagedClaudeRateLimitSnapshot(account),
+            { env, managed: true },
+          );
           return withManagedIdentity(
-            normalizeCodexSnapshot(accountResult, rateLimitResult),
+            normalizeClaudeSnapshot(
+              auth,
+              usage.storedSnapshot,
+              usage.usageState,
+            ),
             account,
           );
+        } catch (error) {
+          return this.managedSnapshotForError(account, error);
         }
-
-        this.ensureManagedClaudeBridge(account);
-        const auth = await this.readClaudeAuth({ env });
-        const usage = await this.collectClaudeUsageSnapshot(
-          auth,
-          this.readManagedClaudeRateLimitSnapshot(account),
-          { env, managed: true },
-        );
-        return withManagedIdentity(
-          normalizeClaudeSnapshot(
-            auth,
-            usage.storedSnapshot,
-            usage.usageState,
-          ),
-          account,
-        );
-      } catch (error) {
-        return this.managedSnapshotForError(account, error);
-      }
-    });
+      },
+    );
+    return this.cacheSnapshot(snapshot);
   }
 
   async getManagedStatus() {
@@ -2320,7 +2364,10 @@ class IntegrationService {
     return mapWithConcurrency(
       accounts,
       MANAGED_REFRESH_CONCURRENCY,
-      (account) => this.refreshManagedIntegration(account.id),
+      (account) =>
+        (!this.managedLoginProcesses.has(account.id) &&
+          this.cachedSnapshot(`managed:${account.id}`)) ||
+        this.refreshManagedIntegration(account.id),
     );
   }
 
@@ -3125,11 +3172,16 @@ class IntegrationService {
   }
 
   async refreshManagedIntegrations() {
-    return this.getManagedStatus();
+    const accounts = this.readManagedAccounts();
+    return mapWithConcurrency(
+      accounts,
+      MANAGED_REFRESH_CONCURRENCY,
+      (account) => this.refreshManagedIntegration(account.id),
+    );
   }
 
   async refreshCodex() {
-    return this.deduplicateRefresh("codex", async () => {
+    const snapshot = await this.deduplicateRefresh("codex", async () => {
       try {
         const { accountResult, rateLimitResult } =
           await this.readCodexAccountAndRateLimits();
@@ -3138,13 +3190,14 @@ class IntegrationService {
         return this.snapshotForError("codex", error);
       }
     });
+    return this.cacheSnapshot(snapshot);
   }
 
   async refreshClaude({ requireBridge = true } = {}) {
     const refreshKey = requireBridge
       ? "claude-with-bridge"
       : "claude-auth-only";
-    return this.deduplicateRefresh(refreshKey, async () => {
+    const snapshot = await this.deduplicateRefresh(refreshKey, async () => {
       try {
         if (requireBridge) {
           // Upgrade only a TokenCat-owned legacy bridge. OAuth usage and
@@ -3172,6 +3225,7 @@ class IntegrationService {
         return this.snapshotForError("claude", error);
       }
     });
+    return this.cacheSnapshot(snapshot);
   }
 
   async refreshConnectedProvider(provider) {
@@ -3179,10 +3233,10 @@ class IntegrationService {
       return errorSnapshot("codex", "error", "INVALID_PROVIDER");
     }
     if (provider === "claude" && this.claudeLoginProcess) {
-      return connectingSnapshot("claude");
+      return this.cacheSnapshot(connectingSnapshot("claude"));
     }
     if (!this.readConnections()[provider]) {
-      return disconnectedSnapshot(provider);
+      return this.cacheSnapshot(disconnectedSnapshot(provider));
     }
 
     const snapshot =
@@ -3191,16 +3245,29 @@ class IntegrationService {
         : await this.refreshClaude();
 
     // Do not let a refresh that began before disconnect resurrect a card.
-    return this.readConnections()[provider]
-      ? snapshot
-      : disconnectedSnapshot(provider);
+    return this.cacheSnapshot(
+      this.readConnections()[provider]
+        ? snapshot
+        : disconnectedSnapshot(provider),
+    );
   }
 
   async getStatus() {
-    return Promise.all([
-      this.refreshConnectedProvider("codex"),
-      this.refreshConnectedProvider("claude"),
-    ]);
+    const connections = this.readConnections();
+    return Promise.all(
+      ["codex", "claude"].map((provider) => {
+        if (!connections[provider]) {
+          return this.cacheSnapshot(disconnectedSnapshot(provider));
+        }
+        if (provider === "claude" && this.claudeLoginProcess) {
+          return this.refreshConnectedProvider(provider);
+        }
+        return (
+          this.cachedSnapshot(`system:${provider}`) ??
+          this.refreshConnectedProvider(provider)
+        );
+      }),
+    );
   }
 
   async connect(provider) {
@@ -3313,6 +3380,14 @@ class IntegrationService {
     for (const child of this.activeChildren) terminateProcessTree(child);
     this.activeChildren.clear();
     this.managedOpenProcesses.clear();
+    this.refreshesInFlight.clear();
+    this.snapshotCache.clear();
+    this.claudeUsageCache.clear();
+    this.claudeUsageRequests.clear();
+    this.claudeTranscriptCache.clear();
+    this.globalClaudeAuthCache = null;
+    this.globalClaudeAuthRequest = null;
+    this.snapshotListener = null;
   }
 }
 
