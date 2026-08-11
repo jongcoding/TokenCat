@@ -117,9 +117,12 @@ v0.26.0 이하의 기존 Portable 사용자는 설치형으로 자동 전환할 
 ### Claude
 
 - 계정별 `CLAUDE_CONFIG_DIR`에서 Claude 공식 로그인을 실행합니다.
-- 공식 OAuth 사용량 응답에서 5시간·주간 사용률과 초기화 시각을 가져옵니다.
-- Claude Code 로컬 transcript에서는 마지막 응답의 `usage` 숫자만 읽어 현재 컨텍스트 입력·캐시·출력 토큰을 계산합니다.
-- 초기화 시각이 지난 오래된 한도는 숨기고, 다음 Claude Code 사용 뒤 최신 수치로 갱신합니다.
+- 공식 OAuth 사용량 응답에서 웹·Claude Desktop·Claude Code가 공유하는 5시간·주간 사용률과 초기화 시각을 가져옵니다.
+- 사용량 조회용 access token은 만료 전에 공식 Claude CLI를 통해 자동 갱신하며, 동시 갱신과 과도한 재요청을 방지합니다.
+- Claude Code 로컬 transcript에서는 마지막 응답의 `usage` 숫자만 읽어 이 PC의 최신 컨텍스트 입력·캐시·출력 토큰을 계산합니다. 일반 웹·Desktop 대화 토큰은 포함되지 않습니다.
+- 초기화 시각이 지난 오래된 한도는 숨기고, TokenCat이 보이는 동안 주기적으로 최신 계정 사용량을 확인합니다.
+- 창을 트레이에 숨겨 둔 동안에도 메인 프로세스가 저빈도로 만료 예정 인증만 유지하므로 웹·Desktop 위주 사용자도 Claude Code를 따로 실행할 필요가 없습니다.
+- refresh token 자체가 최종 만료되거나 철회된 경우에는 설정의 **다시 로그인**으로 공식 로그인 한 번만 완료하면 됩니다.
 
 ### Codex
 
@@ -182,9 +185,9 @@ npm run dist:portable
 5. 모든 검증이 통과한 경우에만 최신 일반 릴리스로 공개
 
 ```powershell
-git tag -a v0.30.0 -m "TokenCat v0.30.0"
+git tag -a v0.30.1 -m "TokenCat v0.30.1"
 git push origin main
-git push origin v0.30.0
+git push origin v0.30.1
 ```
 
 공개한 태그나 같은 버전의 파일을 덮어쓰지 않습니다. 수정이 필요하면 더 높은 patch 버전으로 새 릴리스를 만듭니다.

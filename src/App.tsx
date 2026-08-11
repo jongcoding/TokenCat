@@ -239,7 +239,7 @@ const MIN_AUTO_MINIMAL_WIDTH = 360;
 const MAX_AUTO_MINIMAL_WIDTH = 640;
 const RESPONSIVE_RESIZE_THROTTLE_MS = 90;
 const WIDGET_POINTER_WAKE_THROTTLE_MS = 180;
-const INTEGRATION_POLL_INTERVAL_MS = 60_000;
+const INTEGRATION_POLL_INTERVAL_MS = 2 * 60_000;
 const MIN_WINDOW_OPACITY = 60;
 const MAX_WINDOW_OPACITY = 100;
 const GRID_SINGLE_COLUMN_MEDIA = "(max-width: 650px)";
@@ -807,6 +807,7 @@ const EMPTY_INTEGRATIONS: Record<
     quotas: {},
     contextTokens: null,
     lastUpdatedAt: null,
+    usageUpdatedAt: null,
     authVerifiedAt: null,
     errorCode: null,
   },
@@ -818,6 +819,7 @@ const EMPTY_INTEGRATIONS: Record<
     quotas: {},
     contextTokens: null,
     lastUpdatedAt: null,
+    usageUpdatedAt: null,
     authVerifiedAt: null,
     errorCode: null,
   },
@@ -827,7 +829,7 @@ const EMPTY_UPDATE_STATE: AppUpdateState = {
   status: "disabled",
   distribution: "development",
   supported: false,
-  currentVersion: "0.30.0",
+  currentVersion: "0.30.1",
   availableVersion: null,
   progressPercent: null,
   transferred: null,
@@ -1292,6 +1294,96 @@ function formatPlanName(plan: string | null, provider: Provider) {
   return plan.charAt(0).toUpperCase() + plan.slice(1);
 }
 
+const CLAUDE_USAGE_REAUTH_CODES = new Set([
+  "CLAUDE_USAGE_REAUTH_REQUIRED",
+  "CLAUDE_USAGE_PERMISSION_DENIED",
+  "CLAUDE_USAGE_CREDENTIALS_UNAVAILABLE",
+  "CLAUDE_USAGE_AUTH_ERROR",
+  "CLAUDE_USAGE_TOKEN_EXPIRED",
+]);
+
+function claudeUsageNeedsReauthentication(code?: string | null) {
+  return Boolean(code && CLAUDE_USAGE_REAUTH_CODES.has(code));
+}
+
+function claudeUsageOffersReauthentication(code?: string | null) {
+  return (
+    claudeUsageNeedsReauthentication(code) ||
+    code === "CLAUDE_USAGE_REFRESH_FAILED"
+  );
+}
+
+function claudeUsageErrorMessage(
+  code: string | null | undefined,
+  language: Language,
+) {
+  switch (code) {
+    case "CLAUDE_USAGE_REAUTH_REQUIRED":
+      return translate(
+        language,
+        "자동 인증 갱신도 만료되었습니다. 웹·Desktop 로그인과 별개로 TokenCat의 Claude 계정에 다시 로그인해 주세요.",
+        "Automatic authorization has expired. Sign in to the Claude account in TokenCat again; web and Desktop sign-ins are separate.",
+      );
+    case "CLAUDE_USAGE_PERMISSION_DENIED":
+      return translate(
+        language,
+        "Claude가 이 계정의 사용량 조회를 허용하지 않았습니다. 계정과 플랜을 확인한 뒤 다시 로그인해 주세요.",
+        "Claude did not allow usage access for this account. Check the account and plan, then sign in again.",
+      );
+    case "CLAUDE_USAGE_CREDENTIALS_UNAVAILABLE":
+      return translate(
+        language,
+        "TokenCat용 Claude 인증 정보를 찾지 못했습니다. 다시 로그인해 주세요.",
+        "TokenCat could not find Claude authorization for this account. Sign in again.",
+      );
+    case "CLAUDE_USAGE_AUTH_ERROR":
+    case "CLAUDE_USAGE_TOKEN_EXPIRED":
+      return translate(
+        language,
+        "사용량 인증을 갱신하지 못했습니다. 다시 로그인해 주세요.",
+        "Usage authorization could not be renewed. Sign in again.",
+      );
+    case "CLAUDE_USAGE_REFRESH_FAILED":
+      return translate(
+        language,
+        "사용량 인증 자동 갱신을 완료하지 못했습니다. 네트워크가 복구되면 다시 시도하며, 계속되면 다시 로그인해 주세요.",
+        "Automatic usage authorization did not finish. TokenCat retries when the network recovers; sign in again if it persists.",
+      );
+    case "CLAUDE_USAGE_RATE_LIMITED":
+      return translate(
+        language,
+        "요청이 많아 사용량 조회를 잠시 쉬고 있습니다. TokenCat이 간격을 늘려 자동으로 다시 시도합니다.",
+        "Usage checks are paused briefly because of rate limiting. TokenCat backs off and retries automatically.",
+      );
+    case "CLAUDE_USAGE_NETWORK_ERROR":
+      return translate(
+        language,
+        "네트워크에 연결되면 자동으로 다시 확인합니다. 지금은 최근 값을 표시합니다.",
+        "TokenCat checks again when the network recovers. Recent values are shown for now.",
+      );
+    case "CLAUDE_USAGE_RESPONSE_INVALID":
+      return translate(
+        language,
+        "Claude 사용량 응답을 확인하지 못했습니다. 잠시 후 자동으로 다시 시도합니다.",
+        "Claude returned an unsupported usage response. TokenCat retries automatically.",
+      );
+    default:
+      return translate(
+        language,
+        "공식 사용량을 다시 확인하는 중입니다.",
+        "Retrying the official usage check.",
+      );
+  }
+}
+
+function integrationStatusClass(snapshot: IntegrationSnapshot) {
+  if (claudeUsageNeedsReauthentication(snapshot.usageErrorCode)) {
+    return "error";
+  }
+  if (snapshot.usageErrorCode) return "connecting";
+  return snapshot.status;
+}
+
 function integrationStatusLabel(
   snapshot: IntegrationSnapshot,
   busy: boolean,
@@ -1302,6 +1394,12 @@ function integrationStatusLabel(
     return translate(language, "로그인 중", "Signing in");
   }
   if (snapshot.connected) {
+    if (claudeUsageNeedsReauthentication(snapshot.usageErrorCode)) {
+      return translate(language, "재로그인 필요", "Sign-in required");
+    }
+    if (snapshot.usageErrorCode) {
+      return translate(language, "최근 값 · 재시도 중", "Recent data · retrying");
+    }
     return snapshot.quotas.fiveHour || snapshot.quotas.weekly
       ? translate(
           language,
@@ -1546,7 +1644,9 @@ function accountFromIntegration(
     previous?.quotas.fiveHour.visible || previous?.quotas.weekly.visible;
   const hasUsage = Boolean(fiveHour || weekly);
   const isAuthenticationFailure =
-    snapshot.errorCode?.endsWith("_NOT_AUTHENTICATED") === true;
+    snapshot.errorCode?.endsWith("_NOT_AUTHENTICATED") === true ||
+    claudeUsageNeedsReauthentication(snapshot.usageErrorCode);
+  const hasUsageFailure = Boolean(snapshot.usageErrorCode);
   const isTransientFailure =
     Boolean(previousHasUsage) &&
     snapshot.status === "error" &&
@@ -1602,18 +1702,24 @@ function accountFromIntegration(
       ? `managed-${accountId}`
       : `local-${snapshot.provider}`,
     syncState:
-      isTransientFailure
-      ? "stale"
-      : snapshot.errorCode ||
-      String(snapshot.status) === "error" ||
-      (isManaged &&
-        !snapshot.connected &&
-        String(snapshot.status) !== "connecting" &&
-        Boolean(snapshot.lastUpdatedAt))
-      ? "error"
-      : snapshot.connected && hasUsage
-        ? "idle"
-        : "waiting",
+      hasUsageFailure
+        ? isAuthenticationFailure
+          ? "error"
+          : hasUsage || Boolean(previousHasUsage)
+            ? "stale"
+            : "waiting"
+        : isTransientFailure
+          ? "stale"
+          : snapshot.errorCode ||
+              String(snapshot.status) === "error" ||
+              (isManaged &&
+                !snapshot.connected &&
+                String(snapshot.status) !== "connecting" &&
+                Boolean(snapshot.lastUpdatedAt))
+            ? "error"
+            : snapshot.connected && hasUsage
+              ? "idle"
+              : "waiting",
     lastSyncedAt: snapshot.lastUpdatedAt ?? previous?.lastSyncedAt,
     contextTokens:
       normalizeContextTokens(snapshot.contextTokens) ??
@@ -2017,10 +2123,10 @@ function ContextTokenUsage({
   const description = t(
     `Claude Code 최신 컨텍스트 입력 ${input} + 출력 ${output} = ${total} 토큰${
       observedAt ? ` · ${observedAt} 수신` : ""
-    }. 구독 한도에서 사용된 총 토큰은 아닙니다.`,
+    }. 웹·일반 Desktop 대화와 구독 한도 총사용량은 포함되지 않습니다.`,
     `Latest Claude Code context: ${input} input + ${output} output = ${total} tokens${
       observedAt ? ` · received ${observedAt}` : ""
-    }. This is not the total token usage against your subscription limit.`,
+    }. Web and regular Desktop chats and total subscription usage are not included.`,
   );
 
   return (
@@ -2029,7 +2135,7 @@ function ContextTokenUsage({
       title={description}
       aria-label={description}
     >
-      <span>{t("현재 컨텍스트", "Current context")}</span>
+      <span>{t("Claude Code 컨텍스트", "Claude Code context")}</span>
       {mode === "detail" ? (
         <strong>
           {t(`입력 ${input} · 출력 ${output}`, `In ${input} · Out ${output}`)}
@@ -3111,8 +3217,8 @@ function UsageInsightsView({
               disabled={!selectedAccount?.contextTokens}
             >
               {t(
-                "토큰 · 현재 컨텍스트",
-                "Tokens · current context",
+                "토큰 · Claude Code 컨텍스트",
+                "Tokens · Claude Code context",
               )}
             </option>
           </select>
@@ -3577,7 +3683,7 @@ function App() {
   ] = useState(true);
   const [openAtLogin, setOpenAtLogin] = useState(false);
   const [packaged, setPackaged] = useState(false);
-  const [version, setVersion] = useState("0.30.0");
+  const [version, setVersion] = useState("0.30.1");
   const [updateState, setUpdateState] =
     useState<AppUpdateState>(EMPTY_UPDATE_STATE);
   const [updateActionBusy, setUpdateActionBusy] = useState<
@@ -4924,12 +5030,24 @@ function App() {
         promise: Promise<IntegrationSnapshot[]>;
         epoch?: number;
       }> = [];
-      if (bridge.refreshIntegration) {
+      if (bridge.refreshIntegrations) {
         requests.push({
           kind: "system",
-          promise: bridge
-            .refreshIntegration("codex")
-            .then((snapshot) => [snapshot]),
+          promise: bridge.refreshIntegrations(),
+        });
+      } else if (bridge.refreshIntegration) {
+        requests.push({
+          kind: "system",
+          promise: Promise.all(
+            (["codex", "claude"] as const).map((provider) =>
+              bridge.refreshIntegration?.(provider),
+            ),
+          ).then((snapshots) =>
+            snapshots.filter(
+              (snapshot): snapshot is IntegrationSnapshot =>
+                Boolean(snapshot),
+            ),
+          ),
         });
       }
       if (bridge.refreshManagedIntegrations) {
@@ -6335,19 +6453,41 @@ function App() {
       const usageCount = snapshots.filter(
         (snapshot) =>
           snapshot.connected &&
+          !snapshot.usageErrorCode &&
           (snapshot.quotas.fiveHour ||
             snapshot.quotas.weekly ||
             snapshot.contextTokens),
       ).length;
       const authenticatedCount = snapshots.filter(
-        (snapshot) => snapshot.connected,
+        (snapshot) => snapshot.connected && !snapshot.usageErrorCode,
+      ).length;
+      const reauthenticationCount = snapshots.filter(
+        (snapshot) =>
+          snapshot.connected &&
+          claudeUsageNeedsReauthentication(snapshot.usageErrorCode),
+      ).length;
+      const retryingCount = snapshots.filter(
+        (snapshot) =>
+          snapshot.connected &&
+          Boolean(snapshot.usageErrorCode) &&
+          !claudeUsageNeedsReauthentication(snapshot.usageErrorCode),
       ).length;
       setToast(
-        usageCount
+        reauthenticationCount
+          ? t(
+              `${reauthenticationCount}개 Claude 계정은 다시 로그인이 필요합니다. 최근 값은 유지했습니다.`,
+              `${reauthenticationCount} Claude account(s) need to sign in again. Recent values were kept.`,
+            )
+          : usageCount
           ? t(
               `${usageCount}개 AI 계정의 최신 사용량 데이터를 동기화했습니다.`,
               `Synchronized fresh usage data for ${usageCount} AI accounts.`,
             )
+          : retryingCount
+            ? t(
+                `${retryingCount}개 Claude 계정의 최근 값을 유지하고 자동 재시도합니다.`,
+                `Keeping recent values for ${retryingCount} Claude account(s) and retrying automatically.`,
+              )
           : authenticatedCount
             ? t(
                 `${authenticatedCount}개 AI 계정의 공식 로그인을 확인했습니다. 사용량 조회는 자동으로 다시 시도합니다.`,
@@ -6449,6 +6589,39 @@ function App() {
     }
   };
 
+  const reauthenticateClaude = async () => {
+    const bridge = window.tokenCat;
+    if (!bridge?.reauthenticateIntegration || integrationBusy) return;
+
+    setIntegrationBusy("claude");
+    try {
+      const snapshot = await bridge.reauthenticateIntegration("claude");
+      applyIntegrationSnapshots([snapshot]);
+      setToast(
+        snapshot.status === "connecting"
+          ? t(
+              "Claude 공식 로그인 페이지를 열었습니다. 완료하면 새 인증으로 사용량을 다시 확인합니다.",
+              "Opened the official Claude sign-in. TokenCat checks usage with the renewed authorization when it finishes.",
+            )
+          : snapshot.connected
+            ? t(
+                "Claude 인증을 갱신하고 사용량을 다시 확인했습니다.",
+                "Renewed Claude authorization and checked usage again.",
+              )
+            : integrationFailureMessage(snapshot, language),
+      );
+    } catch {
+      setToast(
+        t(
+          "Claude 공식 로그인 창을 열지 못했습니다. 잠시 후 다시 시도해 주세요.",
+          "Could not open the official Claude sign-in. Try again shortly.",
+        ),
+      );
+    } finally {
+      setIntegrationBusy(null);
+    }
+  };
+
   const startManagedLogin = async (accountId: string) => {
     const bridge = getManagedBridge();
     if (!bridge?.startManagedIntegrationLogin || managedIntegrationBusy) {
@@ -6499,8 +6672,8 @@ function App() {
       setToast(
         provider === "Claude"
           ? t(
-              "이 창에서 Claude를 사용하면 해당 계정의 최신 컨텍스트 토큰이 구분되어 갱신됩니다. 5시간·주간 한도는 자동 갱신됩니다.",
-              "Using Claude in this window updates context tokens for this account. Its 5-hour and weekly limits refresh automatically.",
+              "이 창에서 Claude Code를 사용하면 해당 계정의 최신 컨텍스트 토큰이 구분되어 갱신됩니다. 5시간·주간 한도는 웹·Desktop·Claude Code 사용량을 합쳐 자동 갱신됩니다.",
+              "Using Claude Code in this window updates context tokens for this account. Its 5-hour and weekly limits refresh automatically across web, Desktop, and Claude Code usage.",
             )
           : t(
               "선택한 Codex 계정으로 새 창을 열었습니다.",
@@ -7869,8 +8042,8 @@ function App() {
                       <span>
                         {managedId && account.provider === "Claude"
                           ? t(
-                              "공식 사용량을 다시 확인하는 중입니다. 다른 계정의 컨텍스트 토큰은 설정에서 해당 계정으로 Claude를 열어 사용해 주세요.",
-                              "Retrying official usage. For a different account's context tokens, open Claude for that account from Settings.",
+                              "공식 사용량을 다시 확인하는 중입니다. 다른 계정의 컨텍스트 토큰은 설정에서 해당 계정으로 Claude Code를 열어 사용해 주세요.",
+                              "Retrying official usage. For a different account's context tokens, open Claude Code for that account from Settings.",
                             )
                           : account.provider === "Claude"
                           ? t(
@@ -7891,10 +8064,17 @@ function App() {
                       </strong>
                       <span>
                         {t(
-                          "설정에서 연결 상태를 다시 확인해 주세요.",
-                          "Check the connection again in Settings.",
+                          "최근 값은 유지했습니다. 계정 설정에서 오류 원인을 확인하고 필요하면 다시 로그인해 주세요.",
+                          "Recent values were kept. Check the cause in account settings and sign in again if needed.",
                         )}
                       </span>
+                      <button
+                        type="button"
+                        className="live-account-message__action"
+                        onClick={() => openSettingsPanel("accounts")}
+                      >
+                        {t("계정 설정", "Account settings")}
+                      </button>
                     </div>
                   ) : quotas.length > 0 ? (
                     <div className="account-stats">
@@ -8813,11 +8993,23 @@ function App() {
                               candidate.matchesGlobalAccount === true,
                           )
                         : undefined;
-                    const statusLabel = matchingManagedClaude
-                      ? t(
-                          "동일 Max 계정이 아래 등록 계정으로 연결됨",
-                          "Same Max account linked below",
-                        )
+                    const needsClaudeReauthentication =
+                      provider === "claude" &&
+                      claudeUsageOffersReauthentication(
+                        snapshot.usageErrorCode,
+                      );
+                    const statusLabel =
+                      matchingManagedClaude && !needsClaudeReauthentication
+                      ? matchingManagedClaude.usageErrorCode
+                        ? integrationStatusLabel(
+                            matchingManagedClaude,
+                            busy,
+                            language,
+                          )
+                        : t(
+                            "동일 Max 계정이 아래 등록 계정으로 연결됨",
+                            "Same Max account linked below",
+                          )
                       : integrationStatusLabel(
                           snapshot,
                           busy,
@@ -8827,7 +9019,7 @@ function App() {
                       snapshot.quotas.fiveHour || snapshot.quotas.weekly,
                     );
                     const lastUsageAt = formatObservationTime(
-                      snapshot.lastUpdatedAt,
+                      snapshot.usageUpdatedAt ?? null,
                       language,
                     );
                     const description =
@@ -8837,8 +9029,8 @@ function App() {
                             "Reads the live weekly limit and reset time from Codex App Server.",
                           )
                         : t(
-                            "Claude 공식 계정 사용량에서 5시간·주간 한도를 받고, 로컬 Claude Code에서 최신 컨텍스트 토큰 수만 읽습니다.",
-                            "Reads 5-hour and weekly limits from Claude account usage and only the latest context token counts from local Claude Code data.",
+                            "5시간·주간 한도는 같은 계정의 웹·Desktop·Claude Code 사용량을 합쳐 받고, 토큰 수는 이 PC의 최신 Claude Code 컨텍스트만 읽습니다.",
+                            "5-hour and weekly limits combine web, Desktop, and Claude Code usage for the account. Token counts cover only the latest Claude Code context on this PC.",
                           );
 
                     return (
@@ -8856,14 +9048,15 @@ function App() {
                           <div>
                             <strong>{providerName}</strong>
                             <span
-                              className={`integration-status integration-status--${matchingManagedClaude ? "connected" : snapshot.status}`}
+                              className={`integration-status integration-status--${matchingManagedClaude && !needsClaudeReauthentication ? integrationStatusClass(matchingManagedClaude) : integrationStatusClass(snapshot)}`}
                             >
                               <i aria-hidden="true" />
                               {statusLabel}
                             </span>
                           </div>
                           <small>{description}</small>
-                          {matchingManagedClaude && (
+                          {matchingManagedClaude &&
+                            !needsClaudeReauthentication && (
                             <em>
                               {formatPlanName(
                                 matchingManagedClaude.plan,
@@ -8885,16 +9078,12 @@ function App() {
                             snapshot.connected &&
                             !hasCurrentClaudeLimits && (
                               <small>
-                                {lastUsageAt
-                                  ? t(
-                                      `마지막 사용량 수신 ${lastUsageAt} · 공식 계정 사용량을 자동으로 다시 확인합니다.`,
-                                      `Last usage received ${lastUsageAt} · official account usage will be checked again automatically.`,
-                                    )
-                                  : snapshot.usageErrorCode ===
-                                      "CLAUDE_USAGE_AUTH_ERROR"
+                                {snapshot.usageErrorCode
+                                  ? `${claudeUsageErrorMessage(snapshot.usageErrorCode, language)}${lastUsageAt ? t(` · 마지막 정상 수신 ${lastUsageAt}`, ` · last successful update ${lastUsageAt}`) : ""}`
+                                  : lastUsageAt
                                     ? t(
-                                        "사용량 인증이 만료되었습니다. Claude를 한 번 사용하거나 다시 로그인하면 자동 재시도합니다.",
-                                        "Usage authorization expired. TokenCat retries after you use Claude or sign in again.",
+                                        `마지막 사용량 수신 ${lastUsageAt} · 공식 계정 사용량을 자동으로 다시 확인합니다.`,
+                                        `Last usage received ${lastUsageAt} · official account usage will be checked again automatically.`,
                                       )
                                     : t(
                                         "공식 계정 사용량을 확인하는 중입니다. 네트워크가 복구되면 자동 재시도합니다.",
@@ -8905,12 +9094,14 @@ function App() {
                           {provider === "claude" &&
                             snapshot.connected &&
                             hasCurrentClaudeLimits &&
-                            lastUsageAt && (
+                            (lastUsageAt || snapshot.usageErrorCode) && (
                               <small>
-                                {t(
-                                  `최신 사용량 수신 ${lastUsageAt}`,
-                                  `Latest usage received ${lastUsageAt}`,
-                                )}
+                                {snapshot.usageErrorCode
+                                  ? `${claudeUsageErrorMessage(snapshot.usageErrorCode, language)}${lastUsageAt ? t(` · 마지막 정상 수신 ${lastUsageAt}`, ` · last successful update ${lastUsageAt}`) : ""}`
+                                  : t(
+                                      `최신 사용량 수신 ${lastUsageAt}`,
+                                      `Latest usage received ${lastUsageAt}`,
+                                    )}
                               </small>
                             )}
                           {snapshot.status === "conflict" && (
@@ -8929,21 +9120,29 @@ function App() {
                               ? "is-connected"
                               : ""
                           }
-                          onClick={() => void changeIntegration(provider)}
+                          onClick={() =>
+                            void (needsClaudeReauthentication
+                              ? reauthenticateClaude()
+                              : changeIntegration(provider))
+                          }
                           disabled={
                             busy ||
                             integrationBusy !== null ||
                             snapshot.status === "connecting" ||
                             snapshot.status === "conflict" ||
-                            Boolean(matchingManagedClaude)
+                            (Boolean(matchingManagedClaude) &&
+                              !needsClaudeReauthentication)
                           }
                         >
                           {busy
                             ? t("확인 중", "Checking")
                             : snapshot.status === "connecting"
                               ? t("로그인 중", "Signing in")
-                            : matchingManagedClaude
+                            : matchingManagedClaude &&
+                                !needsClaudeReauthentication
                               ? t("아래 연결됨", "Linked below")
+                            : needsClaudeReauthentication
+                              ? t("다시 로그인", "Sign in again")
                             : snapshot.connected
                               ? t("해제", "Disconnect")
                               : snapshot.status === "conflict"
@@ -8957,8 +9156,8 @@ function App() {
               </div>
               <p className="integration-note">
                 {t(
-                  "Codex는 기존 ChatGPT 로그인을 재사용합니다. Claude의 5시간·주간 수치는 공식 계정 사용량에서 자동 갱신되며, 프롬프트나 로그인 토큰은 저장하지 않습니다.",
-                  "Codex reuses your existing ChatGPT sign-in. Claude 5-hour and weekly values refresh automatically from official account usage; prompts and login tokens are never stored.",
+                  "Codex는 기존 ChatGPT 로그인을 재사용합니다. Claude의 5시간·주간 수치는 웹·Desktop·Claude Code가 공유하는 계정 한도이며 자동 갱신됩니다. TokenCat은 프롬프트나 로그인 토큰을 별도로 저장하지 않습니다.",
+                  "Codex reuses your existing ChatGPT sign-in. Claude 5-hour and weekly values are shared across web, Desktop, and Claude Code and refresh automatically. TokenCat does not separately store prompts or login tokens.",
                 )}
               </p>
             </div>
@@ -9001,7 +9200,7 @@ function App() {
                           fallbackAccountName(providerName, language);
                       const busy = managedIntegrationBusy === accountId;
                       const managedLastUsageAt = formatObservationTime(
-                        snapshot.lastUpdatedAt,
+                        snapshot.usageUpdatedAt ?? null,
                         language,
                       );
                       const managedFiveHour =
@@ -9024,7 +9223,7 @@ function App() {
                             <div className="managed-integration-row__summary">
                               <strong>{displayName}</strong>
                               <span
-                                className={`integration-status integration-status--${snapshot.status}`}
+                                className={`integration-status integration-status--${integrationStatusClass(snapshot)}`}
                               >
                                 <i aria-hidden="true" />
                                 {integrationStatusLabel(
@@ -9048,7 +9247,8 @@ function App() {
                             </small>
                             {snapshot.provider === "claude" &&
                               snapshot.connected &&
-                              snapshot.usageSource === "oauth" && (
+                              snapshot.usageSource === "oauth" &&
+                              !snapshot.usageErrorCode && (
                                 <em>
                                   {t(
                                     `공식 OAuth 사용량 수신 · 5시간 ${managedFiveHour ?? "—"}% · 주간 ${managedWeekly ?? "—"}%${managedLastUsageAt ? ` · ${managedLastUsageAt}` : ""}`,
@@ -9060,16 +9260,7 @@ function App() {
                               snapshot.connected &&
                               snapshot.usageErrorCode && (
                                 <small>
-                                  {snapshot.usageErrorCode ===
-                                  "CLAUDE_USAGE_AUTH_ERROR"
-                                    ? t(
-                                        "공식 사용량 인증 갱신을 기다리는 중입니다. Claude 사용 후 자동 재시도합니다.",
-                                        "Waiting for usage authorization to refresh. TokenCat retries after Claude is used.",
-                                      )
-                                    : t(
-                                        "공식 사용량을 다시 확인하는 중입니다.",
-                                        "Retrying official usage refresh.",
-                                      )}
+                                  {`${claudeUsageErrorMessage(snapshot.usageErrorCode, language)}${managedLastUsageAt ? t(` · 마지막 정상 수신 ${managedLastUsageAt}`, ` · last successful update ${managedLastUsageAt}`) : ""}`}
                                 </small>
                               )}
                             <div className="managed-integration-row__actions">
@@ -9091,8 +9282,12 @@ function App() {
                                 disabled={busy || !snapshot.connected}
                               >
                                 {t(
-                                  `이 계정으로 ${providerName} 열기`,
-                                  `Open ${providerName} for this account`,
+                                  snapshot.provider === "claude"
+                                    ? "이 계정으로 Claude Code 열기"
+                                    : `이 계정으로 ${providerName} 열기`,
+                                  snapshot.provider === "claude"
+                                    ? "Open Claude Code for this account"
+                                    : `Open ${providerName} for this account`,
                                 )}
                               </button>
                               <button
@@ -9130,8 +9325,8 @@ function App() {
               )}
               <p className="managed-integration-note">
                 {t(
-                  "Claude의 5시간·주간 사용량은 로그인한 계정에서 자동 갱신됩니다. 서로 다른 계정의 최신 컨텍스트 토큰은 ‘이 계정으로 Claude 열기’ 창을 사용할 때 구분됩니다. TokenCat은 프롬프트나 로그인 토큰을 저장하지 않습니다.",
-                  "Claude 5-hour and weekly usage refresh automatically for the signed-in account. For different accounts, latest context tokens are distinguished when you use “Open Claude for this account.” TokenCat never stores prompts or login tokens.",
+                  "Claude의 5시간·주간 사용량은 웹·Desktop·Claude Code가 공유하는 계정 한도에서 자동 갱신됩니다. 서로 다른 계정의 최신 로컬 컨텍스트 토큰은 ‘이 계정으로 Claude Code 열기’ 창을 사용할 때 구분됩니다. TokenCat은 프롬프트나 로그인 토큰을 별도로 저장하지 않습니다.",
+                  "Claude 5-hour and weekly usage refreshes from the account-wide limit shared by web, Desktop, and Claude Code. For different accounts, latest local context tokens are distinguished when you use “Open Claude Code for this account.” TokenCat does not separately store prompts or login tokens.",
                 )}
               </p>
             </div>
@@ -9457,8 +9652,8 @@ function App() {
                   </strong>
                   <small>
                     {t(
-                      "로컬 Claude Code의 최신 컨텍스트 입력·출력 토큰 수입니다. 구독 한도 총사용량은 아닙니다.",
-                      "Input and output token counts for the latest local Claude Code context, not total usage against the subscription limit.",
+                      "이 PC의 로컬 Claude Code 최신 컨텍스트 입력·출력 토큰 수입니다. 웹·일반 Desktop 대화와 구독 한도 총사용량은 포함되지 않습니다.",
+                      "Input and output token counts for the latest local Claude Code context on this PC. Web and regular Desktop chats and total subscription usage are not included.",
                     )}
                   </small>
                 </div>
@@ -10151,8 +10346,8 @@ function App() {
                       <>
                         {" "}
                         {t(
-                          "5시간·주간 사용량은 자동 갱신됩니다. 다른 Claude 계정의 컨텍스트 토큰을 구분하려면 ‘이 계정으로 Claude 열기’를 사용하세요.",
-                          "5-hour and weekly usage refresh automatically. Use “Open Claude for this account” to distinguish context tokens for another Claude account.",
+                          "5시간·주간 사용량은 웹·Desktop 사용까지 합쳐 자동 갱신됩니다. 다른 Claude 계정의 로컬 컨텍스트 토큰을 구분하려면 ‘이 계정으로 Claude Code 열기’를 사용하세요.",
+                          "5-hour and weekly usage refresh automatically, including web and Desktop usage. Use “Open Claude Code for this account” to distinguish local context tokens for another Claude account.",
                         )}
                       </>
                     )}

@@ -182,6 +182,7 @@ try {
   $existingFiveHourReset = $null
   $existingWeeklyUsed = $null
   $existingWeeklyReset = $null
+  $existingUsageUpdatedAt = $null
   $existingContextInput = $null
   $existingContextOutput = $null
   $existingContextWindowSize = $null
@@ -194,6 +195,9 @@ try {
       $existingFiveHourReset = Convert-ToEpoch $existing.fiveHour.resetsAt
       $existingWeeklyUsed = Convert-ToPercent $existing.weekly.usedPercent
       $existingWeeklyReset = Convert-ToEpoch $existing.weekly.resetsAt
+      if ($existing.usageUpdatedAt -is [string]) {
+        $existingUsageUpdatedAt = $existing.usageUpdatedAt
+      }
       $existingContextInput =
         Convert-ToTokenCount $existing.contextTokens.inputTokens
       $existingContextOutput =
@@ -288,6 +292,11 @@ try {
     if ($null -eq $weeklyReset) { $weeklyReset = $existingWeeklyReset }
   }
 
+  $usageUpdatedAt = $existingUsageUpdatedAt
+  if ($changedFiveHour -or $changedWeekly) {
+    $usageUpdatedAt = [DateTimeOffset]::UtcNow.ToString("o")
+  }
+
   if ($hasIncomingContext) {
     $contextObservedAt = [DateTimeOffset]::UtcNow.ToString("o")
   } else {
@@ -317,6 +326,7 @@ try {
       usedPercent = $weeklyUsed
       resetsAt = $weeklyReset
     }
+    usageUpdatedAt = $usageUpdatedAt
     contextTokens = $contextSnapshot
     updatedAt = [DateTimeOffset]::UtcNow.ToString("o")
   }

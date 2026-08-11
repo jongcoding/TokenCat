@@ -143,6 +143,8 @@ contextBridge.exposeInMainWorld("tokenCat", {
   getIntegrationStatus: () => ipcRenderer.invoke("integrations:get-status"),
   connectIntegration: (provider) =>
     ipcRenderer.invoke("integrations:connect", provider),
+  reauthenticateIntegration: (provider) =>
+    ipcRenderer.invoke("integrations:reauthenticate", provider),
   disconnectIntegration: (provider) =>
     ipcRenderer.invoke("integrations:disconnect", provider),
   refreshIntegration: (provider) =>

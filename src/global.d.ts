@@ -62,6 +62,7 @@ declare global {
     };
     contextTokens: IntegrationContextTokens | null;
     lastUpdatedAt: string | null;
+    usageUpdatedAt?: string | null;
     authVerifiedAt: string | null;
     usageSource?: "app-server" | "oauth" | "local" | null;
     usageErrorCode?: string | null;
@@ -171,6 +172,9 @@ declare global {
       getIntegrationStatus: () => Promise<IntegrationSnapshot[]>;
       connectIntegration: (
         provider: IntegrationProvider,
+      ) => Promise<IntegrationSnapshot>;
+      reauthenticateIntegration: (
+        provider: "claude",
       ) => Promise<IntegrationSnapshot>;
       disconnectIntegration: (
         provider: IntegrationProvider,

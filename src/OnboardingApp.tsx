@@ -24,7 +24,7 @@ function OnboardingApp() {
   const [provider, setProvider] = useState<Provider | null>("Claude");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [version, setVersion] = useState("0.30.0");
+  const [version, setVersion] = useState("0.30.1");
   const t = (korean: string, english: string) =>
     language === "en" ? english : korean;
 

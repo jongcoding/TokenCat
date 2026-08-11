@@ -4,6 +4,8 @@ const fs = require("node:fs");
 const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
+const tls = require("node:tls");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 
 const PROVIDERS = new Set(["codex", "claude"]);
 const PROCESS_TIMEOUT_MS = 10_000;
@@ -15,6 +17,13 @@ const CLAUDE_WATCH_DEBOUNCE_MS = 80;
 const CLAUDE_STATUSLINE_REFRESH_SECONDS = 30;
 const CLAUDE_USAGE_CACHE_MS = 45_000;
 const CLAUDE_AUTH_CACHE_MS = 15_000;
+const CLAUDE_CREDENTIAL_REFRESH_LEEWAY_MS = 5 * 60 * 1000;
+const CLAUDE_CREDENTIAL_REFRESH_TIMEOUT_MS = 30_000;
+const CLAUDE_CREDENTIAL_MAINTENANCE_INITIAL_DELAY_MS = 30_000;
+const CLAUDE_CREDENTIAL_MAINTENANCE_INTERVAL_MS = 30 * 60 * 1000;
+const CLAUDE_CREDENTIAL_MAINTENANCE_LEEWAY_MS = 45 * 60 * 1000;
+const CLAUDE_USAGE_BACKOFF_BASE_MS = 2 * 60 * 1000;
+const CLAUDE_USAGE_BACKOFF_MAX_MS = 30 * 60 * 1000;
 const INTEGRATION_STATUS_CACHE_MS = 45_000;
 const CLAUDE_USAGE_RESPONSE_LIMIT_BYTES = 64 * 1024;
 const CLAUDE_CREDENTIALS_LIMIT_BYTES = 1024 * 1024;
@@ -32,6 +41,47 @@ const MANAGED_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const CLAUDE_LOGIN_POLL_MS = 900;
 const CLAUDE_LOGIN_EXIT_GRACE_MS = 5_000;
 const MANAGED_REFRESH_CONCURRENCY = 2;
+const CLAUDE_TRANSPORT_ENV_KEYS = [
+  "CLAUDE_CODE_CERT_STORE",
+  "CLAUDE_CODE_CLIENT_CERT",
+  "CLAUDE_CODE_CLIENT_KEY",
+  "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+  "CLAUDE_CODE_PROXY_RESOLVES_HOSTS",
+];
+const CLAUDE_REFRESH_ENV_KEYS = [
+  "PATH",
+  "PATHEXT",
+  "SYSTEMROOT",
+  "WINDIR",
+  "COMSPEC",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "HOME",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "PROGRAMW6432",
+  "USERNAME",
+  "USERDOMAIN",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "ALL_PROXY",
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  ...CLAUDE_TRANSPORT_ENV_KEYS,
+];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -44,6 +94,7 @@ function disconnectedSnapshot(provider) {
     quotas: {},
     contextTokens: null,
     lastUpdatedAt: null,
+    usageUpdatedAt: null,
     authVerifiedAt: null,
     usageSource: null,
     usageErrorCode: null,
@@ -127,6 +178,41 @@ function epochToIso(value) {
   const milliseconds = numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
   const date = new Date(milliseconds);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function epochToMilliseconds(value) {
+  if (typeof value === "string" && value.trim()) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    }
+    value = numeric;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  const milliseconds = numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  return Number.isFinite(milliseconds) ? milliseconds : null;
+}
+
+function normalizeClaudeOAuthScopes(value) {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/\s+/)
+      : [];
+  const scopes = [...new Set(
+    values
+      .filter((scope) => typeof scope === "string")
+      .map((scope) => scope.trim())
+      .filter(
+        (scope) =>
+          scope &&
+          scope.length <= 256 &&
+          /^[a-z0-9:_-]+$/i.test(scope),
+      ),
+  )];
+  return scopes.length <= 64 ? scopes : [];
 }
 
 function normalizeIso(value) {
@@ -228,10 +314,10 @@ function mergeClaudeUsageSnapshot(storedSnapshot, oauthUsage, contextTokens) {
     stored.contextTokens,
     contextTokens,
   );
-  const localTimestamps = [
-    stored.updatedAt,
-    mergedContext?.observedAt,
-  ]
+  const storedUsageUpdatedAt = normalizeIso(stored.usageUpdatedAt);
+  const usageUpdatedAt =
+    normalizeIso(oauth?.updatedAt) ?? storedUsageUpdatedAt ?? null;
+  const localTimestamps = [usageUpdatedAt, mergedContext?.observedAt]
     .map(normalizeIso)
     .filter(Boolean);
   const newestTimestamp =
@@ -245,6 +331,7 @@ function mergeClaudeUsageSnapshot(storedSnapshot, oauthUsage, contextTokens) {
     fiveHour: oauth ? oauth.fiveHour : stored.fiveHour,
     weekly: oauth ? oauth.weekly : stored.weekly,
     contextTokens: mergedContext,
+    usageUpdatedAt,
     updatedAt: newestTimestamp,
   };
 }
@@ -453,6 +540,7 @@ function normalizeCodexSnapshot(accountResult, rateLimitResult) {
     quotas,
     contextTokens: null,
     lastUpdatedAt: new Date().toISOString(),
+    usageUpdatedAt: new Date().toISOString(),
     authVerifiedAt: null,
     usageSource: "app-server",
     usageErrorCode: null,
@@ -496,6 +584,7 @@ function normalizeClaudeSnapshot(auth, storedSnapshot, usageState = {}) {
     quotas,
     contextTokens: normalizeContextTokens(storedSnapshot?.contextTokens),
     lastUpdatedAt: normalizeIso(storedSnapshot?.updatedAt),
+    usageUpdatedAt: normalizeIso(storedSnapshot?.usageUpdatedAt),
     authVerifiedAt: normalizeIso(auth.verifiedAt),
     usageSource:
       usageState.source === "oauth"
@@ -601,8 +690,19 @@ function isPathInside(rootPath, candidatePath) {
   );
 }
 
-function managedChildEnvironment(provider, profilePath) {
-  const environment = { ...process.env };
+function managedChildEnvironment(
+  provider,
+  profilePath,
+  baseEnvironment = process.env,
+) {
+  const environment = { ...baseEnvironment };
+  const claudeTransportEnvironment = Object.fromEntries(
+    CLAUDE_TRANSPORT_ENV_KEYS.flatMap((key) =>
+      typeof environment[key] === "string" && environment[key]
+        ? [[key, environment[key]]]
+        : [],
+    ),
+  );
   const sensitivePatterns =
     provider === "codex"
       ? [
@@ -627,9 +727,118 @@ function managedChildEnvironment(provider, profilePath) {
   if (provider === "codex") {
     environment.CODEX_HOME = profilePath;
   } else {
+    Object.assign(environment, claudeTransportEnvironment);
     environment.CLAUDE_CONFIG_DIR = profilePath;
   }
   return environment;
+}
+
+function claudeCredentialRefreshEnvironment(
+  profilePath,
+  baseEnvironment = process.env,
+) {
+  const allowedKeys = new Set(
+    CLAUDE_REFRESH_ENV_KEYS.map((key) => key.toUpperCase()),
+  );
+  const environment = {};
+  for (const [key, value] of Object.entries(baseEnvironment)) {
+    if (
+      allowedKeys.has(key.toUpperCase()) &&
+      typeof value === "string" &&
+      value
+    ) {
+      environment[key] = value;
+    }
+  }
+  environment.CLAUDE_CONFIG_DIR = profilePath;
+  return environment;
+}
+
+function environmentValue(environment, name) {
+  const normalizedName = name.toUpperCase();
+  for (const [key, value] of Object.entries(environment)) {
+    if (
+      key.toUpperCase() === normalizedName &&
+      typeof value === "string" &&
+      value
+    ) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function claudeUsageProxyIsBypassed(environment) {
+  const noProxy = environmentValue(environment, "NO_PROXY");
+  if (!noProxy) return false;
+  const hostname = CLAUDE_USAGE_HOST.toLowerCase();
+  return noProxy.split(",").some((entry) => {
+    const candidate = entry.trim().toLowerCase().split(":")[0];
+    if (!candidate) return false;
+    if (candidate === "*") return true;
+    const domain = candidate.startsWith(".")
+      ? candidate.slice(1)
+      : candidate;
+    return hostname === domain || hostname.endsWith(`.${domain}`);
+  });
+}
+
+function readClaudeTransportFile(filePath) {
+  if (typeof filePath !== "string" || !filePath.trim()) return null;
+  const resolvedPath = path.resolve(filePath.trim());
+  const stat = fs.statSync(resolvedPath);
+  if (!stat.isFile() || stat.size > CLAUDE_CREDENTIALS_LIMIT_BYTES) {
+    throw new Error("Unsupported Claude transport file");
+  }
+  return fs.readFileSync(resolvedPath);
+}
+
+function claudeUsageTransportOptions(options = {}) {
+  const environment = isPlainObject(options.env) ? options.env : process.env;
+  const requestOptions = {};
+  const proxy =
+    environmentValue(environment, "HTTPS_PROXY") ??
+    environmentValue(environment, "HTTP_PROXY") ??
+    environmentValue(environment, "ALL_PROXY");
+  if (proxy && !claudeUsageProxyIsBypassed(environment)) {
+    const parsedProxy = new URL(proxy);
+    if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") {
+      throw new Error("Unsupported Claude usage proxy");
+    }
+    requestOptions.agent = new HttpsProxyAgent(parsedProxy);
+  }
+
+  const clientCertificatePath = environmentValue(
+    environment,
+    "CLAUDE_CODE_CLIENT_CERT",
+  );
+  const clientKeyPath = environmentValue(
+    environment,
+    "CLAUDE_CODE_CLIENT_KEY",
+  );
+  if (clientCertificatePath || clientKeyPath) {
+    if (!clientCertificatePath || !clientKeyPath) {
+      throw new Error("Incomplete Claude client certificate configuration");
+    }
+    requestOptions.cert = readClaudeTransportFile(clientCertificatePath);
+    requestOptions.key = readClaudeTransportFile(clientKeyPath);
+    const passphrase = environmentValue(
+      environment,
+      "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+    );
+    if (passphrase) requestOptions.passphrase = passphrase;
+  }
+
+  const extraCertificatePath =
+    environmentValue(environment, "NODE_EXTRA_CA_CERTS") ??
+    environmentValue(environment, "SSL_CERT_FILE");
+  if (extraCertificatePath) {
+    requestOptions.ca = [
+      ...tls.rootCertificates,
+      readClaudeTransportFile(extraCertificatePath),
+    ];
+  }
+  return requestOptions;
 }
 
 async function mapWithConcurrency(values, concurrency, mapper) {
@@ -865,6 +1074,15 @@ class IntegrationService {
     this.snapshotCache = new Map();
     this.claudeUsageCache = new Map();
     this.claudeUsageRequests = new Map();
+    this.claudeUsageHttpRequests = new Set();
+    this.claudeCredentialRefreshRequests = new Map();
+    this.claudeCredentialRefreshBackoff = new Map();
+    this.claudeUsageBackoff = new Map();
+    this.claudeInteractiveLoginProfiles = new Set();
+    this.claudeLoginStartRequest = null;
+    this.managedClaudeLoginStartRequests = new Map();
+    this.claudeCredentialMaintenanceTimer = null;
+    this.claudeCredentialMaintenanceRequest = null;
     this.claudeTranscriptCache = new Map();
     this.globalClaudeAuthCache = null;
     this.globalClaudeAuthRequest = null;
@@ -930,6 +1148,7 @@ class IntegrationService {
       this.startClaudeSnapshotWatcher();
     }
     this.startManagedSnapshotWatcher();
+    this.startClaudeCredentialMaintenance();
   }
 
   setOpenExternal(listener) {
@@ -937,6 +1156,7 @@ class IntegrationService {
   }
 
   cacheSnapshot(snapshot) {
+    if (this.shuttingDown) return snapshot;
     const key = snapshotCacheKey(snapshot);
     this.snapshotCache.delete(key);
     this.snapshotCache.set(key, {
@@ -962,6 +1182,7 @@ class IntegrationService {
   }
 
   emitSnapshot(snapshot) {
+    if (this.shuttingDown) return;
     this.cacheSnapshot(snapshot);
     try {
       this.snapshotListener?.(snapshot);
@@ -1413,11 +1634,14 @@ class IntegrationService {
       };
 
       try {
+        const discardOutput = options.discardOutput === true;
         child = spawn(executablePath, args, {
           shell: false,
           windowsHide: true,
           detached: process.platform !== "win32",
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: discardOutput
+            ? "ignore"
+            : ["ignore", "pipe", "pipe"],
           ...(options.env ? { env: options.env } : {}),
         });
         this.activeChildren.add(child);
@@ -1426,10 +1650,15 @@ class IntegrationService {
         return;
       }
 
+      const requestedTimeout = Number(options.timeoutMs);
+      const timeoutMs =
+        Number.isFinite(requestedTimeout) && requestedTimeout > 0
+          ? Math.min(requestedTimeout, 2 * 60 * 1000)
+          : PROCESS_TIMEOUT_MS;
       const timeout = setTimeout(() => {
         terminateProcessTree(child);
         finish(() => reject(integrationError(`${errorPrefix}_TIMEOUT`)));
-      }, PROCESS_TIMEOUT_MS);
+      }, timeoutMs);
 
       const appendOutput = (current, chunk) => {
         const next = current + chunk.toString("utf8");
@@ -1443,11 +1672,11 @@ class IntegrationService {
         return next;
       };
 
-      child.stdout.on("data", (chunk) => {
+      child.stdout?.on("data", (chunk) => {
         const next = appendOutput(stdout, chunk);
         if (next !== null) stdout = next;
       });
-      child.stderr.on("data", (chunk) => {
+      child.stderr?.on("data", (chunk) => {
         const next = appendOutput(stderr, chunk);
         if (next !== null) stderr = next;
       });
@@ -1554,7 +1783,8 @@ class IntegrationService {
       }
       throw integrationError("CLAUDE_USAGE_CREDENTIALS_UNAVAILABLE");
     }
-    const accessToken = stored?.claudeAiOauth?.accessToken;
+    const oauth = stored?.claudeAiOauth;
+    const accessToken = oauth?.accessToken;
     if (
       typeof accessToken !== "string" ||
       !accessToken.trim() ||
@@ -1562,10 +1792,324 @@ class IntegrationService {
     ) {
       throw integrationError("CLAUDE_USAGE_CREDENTIALS_UNAVAILABLE");
     }
-    return accessToken.trim();
+    const refreshToken = oauth?.refreshToken;
+    return {
+      accessToken: accessToken.trim(),
+      refreshToken:
+        typeof refreshToken === "string" &&
+        refreshToken.trim() &&
+        refreshToken.length <= 64 * 1024
+          ? refreshToken.trim()
+          : null,
+      expiresAt: epochToMilliseconds(oauth?.expiresAt),
+      refreshTokenExpiresAt: epochToMilliseconds(
+        oauth?.refreshTokenExpiresAt,
+      ),
+      scopes: normalizeClaudeOAuthScopes(oauth?.scopes),
+    };
   }
 
-  requestClaudeOAuthUsage(accessToken) {
+  claudeCredentialRefreshKey(options = {}) {
+    const directory = this.claudeConfigDirectory(options);
+    return process.platform === "win32"
+      ? directory.toLowerCase()
+      : directory;
+  }
+
+  claudeProfileCacheKey(options = {}) {
+    return `profile:${crypto
+      .createHash("sha256")
+      .update(this.claudeCredentialRefreshKey(options), "utf8")
+      .digest("hex")}`;
+  }
+
+  claudeCredentialVersionFromCredential(credential) {
+    if (
+      !credential ||
+      typeof credential.accessToken !== "string" ||
+      !credential.accessToken
+    ) {
+      return null;
+    }
+    return crypto
+      .createHash("sha256")
+      .update(credential.accessToken, "utf8")
+      .update("\0", "utf8")
+      .update(credential.refreshToken ?? "", "utf8")
+      .digest("hex");
+  }
+
+  claudeProfileCredentialCacheKey(options = {}, credentialVersion = null) {
+    const profileKey = this.claudeProfileCacheKey(options);
+    return credentialVersion
+      ? `${profileKey}:credential:${credentialVersion}`
+      : profileKey;
+  }
+
+  clearClaudeProfileTransientState(options = {}) {
+    const refreshKey = this.claudeCredentialRefreshKey(options);
+    const profileKey = this.claudeProfileCacheKey(options);
+    this.claudeCredentialRefreshBackoff.delete(refreshKey);
+    for (const collection of [
+      this.claudeUsageBackoff,
+      this.claudeUsageRequests,
+      this.claudeUsageCache,
+    ]) {
+      for (const key of collection.keys()) {
+        if (key === profileKey || key.startsWith(`${profileKey}:credential:`)) {
+          collection.delete(key);
+        }
+      }
+    }
+  }
+
+  claudeCredentialVersion(options = {}) {
+    try {
+      const credential = this.readClaudeOAuthCredential(options);
+      return this.claudeCredentialVersionFromCredential(credential);
+    } catch {
+      return null;
+    }
+  }
+
+  claudeCredentialNeedsRefresh(
+    credential,
+    now = Date.now(),
+    leewayMs = CLAUDE_CREDENTIAL_REFRESH_LEEWAY_MS,
+  ) {
+    return (
+      Number.isFinite(credential?.expiresAt) &&
+      credential.expiresAt <= now + leewayMs
+    );
+  }
+
+  startClaudeCredentialMaintenance() {
+    if (this.shuttingDown || this.claudeCredentialMaintenanceTimer) return;
+    const schedule = (delay) => {
+      if (this.shuttingDown) return;
+      this.claudeCredentialMaintenanceTimer = setTimeout(async () => {
+        this.claudeCredentialMaintenanceTimer = null;
+        try {
+          await this.maintainClaudeCredentials();
+        } catch {
+          // A damaged account registry must not create an unhandled rejection
+          // in Electron's main process. The next low-frequency pass retries.
+        } finally {
+          schedule(CLAUDE_CREDENTIAL_MAINTENANCE_INTERVAL_MS);
+        }
+      }, delay);
+      this.claudeCredentialMaintenanceTimer.unref?.();
+    };
+    schedule(CLAUDE_CREDENTIAL_MAINTENANCE_INITIAL_DELAY_MS);
+  }
+
+  stopClaudeCredentialMaintenance() {
+    if (this.claudeCredentialMaintenanceTimer) {
+      clearTimeout(this.claudeCredentialMaintenanceTimer);
+      this.claudeCredentialMaintenanceTimer = null;
+    }
+  }
+
+  async maintainClaudeCredentials() {
+    if (this.shuttingDown) return;
+    if (this.claudeCredentialMaintenanceRequest) {
+      return this.claudeCredentialMaintenanceRequest;
+    }
+    const task = Promise.resolve().then(async () => {
+      const profiles = [];
+      if (this.readConnections().claude) profiles.push({});
+      for (const account of this.readManagedAccounts()) {
+        if (account.provider !== "claude") continue;
+        profiles.push({
+          env: managedChildEnvironment(
+            "claude",
+            this.managedProfilePath(account),
+          ),
+          managed: true,
+        });
+      }
+      await mapWithConcurrency(
+        profiles,
+        MANAGED_REFRESH_CONCURRENCY,
+        async (options) => {
+          if (this.shuttingDown) return;
+          const profileKey = this.claudeCredentialRefreshKey(options);
+          if (this.claudeInteractiveLoginProfiles.has(profileKey)) return;
+          let credential;
+          try {
+            credential = this.readClaudeOAuthCredential(options);
+          } catch {
+            return;
+          }
+          if (
+            !this.claudeCredentialNeedsRefresh(
+              credential,
+              Date.now(),
+              CLAUDE_CREDENTIAL_MAINTENANCE_LEEWAY_MS,
+            )
+          ) {
+            return;
+          }
+          try {
+            await this.refreshClaudeOAuthCredential(options);
+          } catch {
+            // Backoff and the one-click re-login path handle failed refreshes.
+          }
+        },
+      );
+    });
+    const tracked = task.finally(() => {
+      if (this.claudeCredentialMaintenanceRequest === tracked) {
+        this.claudeCredentialMaintenanceRequest = null;
+      }
+    });
+    this.claudeCredentialMaintenanceRequest = tracked;
+    return tracked;
+  }
+
+  async refreshClaudeOAuthCredential(options = {}) {
+    const refreshKey = this.claudeCredentialRefreshKey(options);
+    const existing = this.claudeCredentialRefreshRequests.get(refreshKey);
+    if (existing) return existing;
+    if (this.claudeInteractiveLoginProfiles.has(refreshKey)) {
+      throw integrationError("CLAUDE_USAGE_REFRESH_FAILED");
+    }
+    const backoff = this.claudeCredentialRefreshBackoff.get(refreshKey);
+    if (backoff && backoff.until > Date.now()) {
+      throw integrationError("CLAUDE_USAGE_REFRESH_FAILED");
+    }
+    if (backoff) this.claudeCredentialRefreshBackoff.delete(refreshKey);
+
+    const task = Promise.resolve()
+      .then(() => this._performClaudeOAuthCredentialRefresh(options))
+      .then(
+        (credential) => {
+          if (!this.shuttingDown) {
+            this.claudeCredentialRefreshBackoff.delete(refreshKey);
+          }
+          return credential;
+        },
+        (error) => {
+          if (
+            !this.shuttingDown &&
+            error?.code === "CLAUDE_USAGE_REFRESH_FAILED"
+          ) {
+            const previous =
+              this.claudeCredentialRefreshBackoff.get(refreshKey);
+            const failures = Math.min(8, (previous?.failures ?? 0) + 1);
+            this.claudeCredentialRefreshBackoff.set(refreshKey, {
+              failures,
+              until:
+                Date.now() +
+                Math.min(
+                  CLAUDE_USAGE_BACKOFF_MAX_MS,
+                  CLAUDE_USAGE_BACKOFF_BASE_MS * 2 ** (failures - 1),
+                ),
+            });
+            while (
+              this.claudeCredentialRefreshBackoff.size >
+              INTEGRATION_STATUS_CACHE_LIMIT
+            ) {
+              const oldestKey =
+                this.claudeCredentialRefreshBackoff.keys().next().value;
+              if (oldestKey === undefined) break;
+              this.claudeCredentialRefreshBackoff.delete(oldestKey);
+            }
+          }
+          throw error;
+        },
+      );
+
+    const tracked = task.finally(() => {
+      if (this.claudeCredentialRefreshRequests.get(refreshKey) === tracked) {
+        this.claudeCredentialRefreshRequests.delete(refreshKey);
+      }
+    });
+    this.claudeCredentialRefreshRequests.set(refreshKey, tracked);
+    return tracked;
+  }
+
+  async _performClaudeOAuthCredentialRefresh(options = {}) {
+    if (this.shuttingDown) {
+      throw integrationError("CLAUDE_USAGE_REFRESH_FAILED");
+    }
+    const credential = this.readClaudeOAuthCredential(options);
+    if (
+      !credential.refreshToken ||
+      !credential.scopes.length ||
+      (Number.isFinite(credential.refreshTokenExpiresAt) &&
+        credential.refreshTokenExpiresAt <= Date.now())
+    ) {
+      throw integrationError("CLAUDE_USAGE_REAUTH_REQUIRED");
+    }
+
+    const executablePath = resolveClaudeExecutable();
+    if (!executablePath) {
+      throw integrationError("CLAUDE_USAGE_REFRESH_FAILED");
+    }
+
+    const environment = claudeCredentialRefreshEnvironment(
+      this.claudeConfigDirectory(options),
+      isPlainObject(options.env) ? options.env : process.env,
+    );
+    environment.CLAUDE_CODE_OAUTH_REFRESH_TOKEN =
+      credential.refreshToken;
+    environment.CLAUDE_CODE_OAUTH_SCOPES = credential.scopes.join(" ");
+
+    let result = null;
+    let executionFailed = false;
+    try {
+      result = await this.runNative(
+        executablePath,
+        ["auth", "login", "--claudeai"],
+        "CLAUDE_USAGE_REFRESH",
+        {
+          env: environment,
+          timeoutMs: CLAUDE_CREDENTIAL_REFRESH_TIMEOUT_MS,
+          discardOutput: true,
+        },
+      );
+    } catch {
+      executionFailed = true;
+    } finally {
+      delete environment.CLAUDE_CODE_OAUTH_REFRESH_TOKEN;
+      delete environment.CLAUDE_CODE_OAUTH_SCOPES;
+    }
+
+    let refreshed = null;
+    try {
+      refreshed = this.readClaudeOAuthCredential(options);
+    } catch {
+      // The classification below returns a renderer-safe error code.
+    }
+    const credentialChanged = Boolean(
+      refreshed &&
+        (refreshed.accessToken !== credential.accessToken ||
+          refreshed.refreshToken !== credential.refreshToken),
+    );
+    if (
+      refreshed &&
+      !this.claudeCredentialNeedsRefresh(refreshed) &&
+      (credentialChanged || result?.exitCode === 0)
+    ) {
+      return refreshed;
+    }
+
+    if (
+      !refreshed?.refreshToken ||
+      !refreshed?.scopes?.length ||
+      (Number.isFinite(refreshed?.refreshTokenExpiresAt) &&
+        refreshed.refreshTokenExpiresAt <= Date.now())
+    ) {
+      throw integrationError("CLAUDE_USAGE_REAUTH_REQUIRED");
+    }
+    if (executionFailed || result?.exitCode !== 0) {
+      throw integrationError("CLAUDE_USAGE_REFRESH_FAILED");
+    }
+    throw integrationError("CLAUDE_USAGE_REAUTH_REQUIRED");
+  }
+
+  requestClaudeOAuthUsage(accessToken, options = {}) {
     return new Promise((resolve, reject) => {
       let settled = false;
       let responseBytes = 0;
@@ -1577,8 +2121,10 @@ class IntegrationService {
       };
       let request;
       try {
+        const transportOptions = claudeUsageTransportOptions(options);
         request = https.request(
           {
+            ...transportOptions,
             protocol: "https:",
             hostname: CLAUDE_USAGE_HOST,
             port: 443,
@@ -1613,9 +2159,21 @@ class IntegrationService {
             response.once("end", () => {
               if (settled) return;
               const statusCode = Number(response.statusCode);
-              if (statusCode === 401 || statusCode === 403) {
+              if (statusCode === 401) {
                 finish(() =>
-                  reject(integrationError("CLAUDE_USAGE_AUTH_ERROR")),
+                  reject(
+                    integrationError("CLAUDE_USAGE_TOKEN_EXPIRED"),
+                  ),
+                );
+                return;
+              }
+              if (statusCode === 403) {
+                finish(() =>
+                  reject(
+                    integrationError(
+                      "CLAUDE_USAGE_PERMISSION_DENIED",
+                    ),
+                  ),
                 );
                 return;
               }
@@ -1648,6 +2206,10 @@ class IntegrationService {
             });
           },
         );
+        this.claudeUsageHttpRequests.add(request);
+        request.once("close", () => {
+          this.claudeUsageHttpRequests.delete(request);
+        });
       } catch {
         reject(integrationError("CLAUDE_USAGE_NETWORK_ERROR"));
         return;
@@ -1669,23 +2231,26 @@ class IntegrationService {
 
   async readClaudeOAuthUsage(auth, options = {}) {
     const now = Date.now();
-    const identityCacheKey =
-      typeof auth?.accountFingerprint === "string"
-        ? `account:${auth.accountFingerprint}`
-        : null;
-    const identityCached = identityCacheKey
-      ? this.claudeUsageCache.get(identityCacheKey) ?? null
-      : null;
-    if (identityCached && identityCached.expiresAt > now) {
-      return { usage: identityCached.usage, errorCode: null };
-    }
-
-    let accessToken;
+    let credential;
     try {
-      accessToken = this.readClaudeOAuthCredential(options);
+      credential = this.readClaudeOAuthCredential(options);
+      if (this.claudeCredentialNeedsRefresh(credential)) {
+        try {
+          credential = await this.refreshClaudeOAuthCredential(options);
+        } catch (error) {
+          if (
+            Number.isFinite(credential.expiresAt) &&
+            credential.expiresAt <= now
+          ) {
+            throw error;
+          }
+          // If the token is only near expiry, use its remaining lifetime and
+          // retry the official refresh after the next usage request.
+        }
+      }
     } catch (error) {
       return {
-        usage: identityCached?.usage ?? null,
+        usage: null,
         errorCode:
           typeof error?.code === "string"
             ? error.code
@@ -1693,40 +2258,161 @@ class IntegrationService {
       };
     }
 
-    const tokenFingerprint = crypto
-      .createHash("sha256")
-      .update(accessToken, "utf8")
-      .digest("hex");
-    const cacheKey = identityCacheKey ?? `token:${tokenFingerprint}`;
+    const credentialVersion =
+      this.claudeCredentialVersionFromCredential(credential);
+    const profileCredentialCacheKey =
+      this.claudeProfileCredentialCacheKey(options, credentialVersion);
     const cached =
-      this.claudeUsageCache.get(cacheKey) ?? identityCached ?? null;
-    if (cached && cached.expiresAt > now) {
+      this.claudeUsageCache.get(profileCredentialCacheKey) ?? null;
+    if (
+      options.forceRefresh !== true &&
+      cached &&
+      cached.expiresAt > now
+    ) {
       return { usage: cached.usage, errorCode: null };
     }
 
-    let request = this.claudeUsageRequests.get(cacheKey);
+    const backoff = this.claudeUsageBackoff.get(
+      profileCredentialCacheKey,
+    );
+    if (backoff && backoff.until > now) {
+      return {
+        usage: cached?.usage ?? null,
+        errorCode:
+          backoff.errorCode ?? "CLAUDE_USAGE_RATE_LIMITED",
+      };
+    }
+
+    const requestKey = profileCredentialCacheKey;
+    let requestCredentialVersion = credentialVersion;
+    let outcomeProfileCacheKey = profileCredentialCacheKey;
+    let request = this.claudeUsageRequests.get(requestKey);
     if (!request) {
-      request = this.requestClaudeOAuthUsage(accessToken)
+      request = Promise.resolve()
+        .then(async () => {
+          try {
+            return await this.requestClaudeOAuthUsage(
+              credential.accessToken,
+              options,
+            );
+          } catch (error) {
+            if (error?.code !== "CLAUDE_USAGE_TOKEN_EXPIRED") {
+              throw error;
+            }
+
+            let refreshed;
+            try {
+              refreshed = await this.refreshClaudeOAuthCredential(
+                options,
+              );
+            } catch (refreshError) {
+              if (
+                refreshError?.code ===
+                  "CLAUDE_USAGE_REAUTH_REQUIRED" ||
+                refreshError?.code ===
+                  "CLAUDE_USAGE_REFRESH_FAILED"
+              ) {
+                throw refreshError;
+              }
+              throw integrationError("CLAUDE_USAGE_REFRESH_FAILED");
+            }
+            requestCredentialVersion =
+              this.claudeCredentialVersionFromCredential(refreshed);
+            outcomeProfileCacheKey =
+              this.claudeProfileCredentialCacheKey(
+                options,
+                requestCredentialVersion,
+              );
+
+            try {
+              return await this.requestClaudeOAuthUsage(
+                refreshed.accessToken,
+                options,
+              );
+            } catch (retryError) {
+              if (
+                retryError?.code === "CLAUDE_USAGE_TOKEN_EXPIRED"
+              ) {
+                throw integrationError(
+                  "CLAUDE_USAGE_REAUTH_REQUIRED",
+                );
+              }
+              throw retryError;
+            }
+          }
+        })
         .then((value) =>
           normalizeClaudeOAuthUsage(value, new Date().toISOString()),
         )
         .then((usage) => {
-          this.claudeUsageCache.set(cacheKey, {
+          if (this.shuttingDown) return usage;
+          this.claudeUsageBackoff.delete(requestKey);
+          this.claudeUsageBackoff.delete(outcomeProfileCacheKey);
+          const cachedUsage = {
             usage,
             expiresAt: Date.now() + CLAUDE_USAGE_CACHE_MS,
-          });
-          if (this.claudeUsageCache.size > MANAGED_ACCOUNT_LIMIT * 2) {
+          };
+          const currentCredentialVersion =
+            this.claudeCredentialVersion(options);
+          if (currentCredentialVersion === requestCredentialVersion) {
+            this.claudeUsageCache.set(
+              outcomeProfileCacheKey,
+              cachedUsage,
+            );
+          }
+          if (
+            this.claudeUsageCache.size >
+            INTEGRATION_STATUS_CACHE_LIMIT
+          ) {
             const oldestKey = this.claudeUsageCache.keys().next().value;
             if (oldestKey !== undefined) {
               this.claudeUsageCache.delete(oldestKey);
             }
           }
           return usage;
+        })
+        .catch((error) => {
+          if (this.shuttingDown) throw error;
+          if (
+            error?.code === "CLAUDE_USAGE_RATE_LIMITED" ||
+            error?.code === "CLAUDE_USAGE_PERMISSION_DENIED"
+          ) {
+            const previous =
+              this.claudeUsageBackoff.get(outcomeProfileCacheKey);
+            const failures =
+              error.code === "CLAUDE_USAGE_RATE_LIMITED"
+                ? Math.min(8, (previous?.failures ?? 0) + 1)
+                : 1;
+            this.claudeUsageBackoff.delete(outcomeProfileCacheKey);
+            this.claudeUsageBackoff.set(outcomeProfileCacheKey, {
+              failures,
+              errorCode: error.code,
+              until:
+                Date.now() +
+                (error.code === "CLAUDE_USAGE_RATE_LIMITED"
+                  ? Math.min(
+                      CLAUDE_USAGE_BACKOFF_MAX_MS,
+                      CLAUDE_USAGE_BACKOFF_BASE_MS *
+                        2 ** (failures - 1),
+                    )
+                  : CLAUDE_USAGE_BACKOFF_MAX_MS),
+            });
+            while (
+              this.claudeUsageBackoff.size >
+              INTEGRATION_STATUS_CACHE_LIMIT
+            ) {
+              const oldestKey =
+                this.claudeUsageBackoff.keys().next().value;
+              if (oldestKey === undefined) break;
+              this.claudeUsageBackoff.delete(oldestKey);
+            }
+          }
+          throw error;
         });
-      this.claudeUsageRequests.set(cacheKey, request);
+      this.claudeUsageRequests.set(requestKey, request);
       request.finally(() => {
-        if (this.claudeUsageRequests.get(cacheKey) === request) {
-          this.claudeUsageRequests.delete(cacheKey);
+        if (this.claudeUsageRequests.get(requestKey) === request) {
+          this.claudeUsageRequests.delete(requestKey);
         }
       }).catch(() => {
         // The original caller receives the sanitized failure below.
@@ -2249,6 +2935,7 @@ class IntegrationService {
             observedAt: stored.contextTokens.observedAt,
           }
         : null,
+      usageUpdatedAt: stored.usageUpdatedAt,
       updatedAt: stored.updatedAt,
     };
   }
@@ -2278,6 +2965,7 @@ class IntegrationService {
             observedAt: stored.contextTokens.observedAt,
           }
         : null,
+      usageUpdatedAt: stored.usageUpdatedAt,
       updatedAt: stored.updatedAt,
     };
   }
@@ -2304,7 +2992,7 @@ class IntegrationService {
     return withManagedIdentity(providerSnapshot, account);
   }
 
-  async refreshManagedIntegration(accountId) {
+  async refreshManagedIntegration(accountId, options = {}) {
     let account;
     try {
       account = this.managedAccount(accountId);
@@ -2314,12 +3002,15 @@ class IntegrationService {
     if (this.managedAccountsBeingRemoved.has(account.id)) {
       throw integrationError("MANAGED_ACCOUNT_NOT_FOUND");
     }
-    if (this.managedLoginProcesses.has(account.id)) {
+    if (
+      this.managedLoginProcesses.has(account.id) ||
+      this.managedClaudeLoginStartRequests.has(account.id)
+    ) {
       return this.cacheSnapshot(connectingManagedSnapshot(account));
     }
 
     const snapshot = await this.deduplicateRefresh(
-      `managed:${account.id}`,
+      `managed:${account.id}:${options.forceUsage === true ? "force" : "cached"}`,
       async () => {
         try {
           const profilePath = this.managedProfilePath(account);
@@ -2341,7 +3032,11 @@ class IntegrationService {
           const usage = await this.collectClaudeUsageSnapshot(
             auth,
             this.readManagedClaudeRateLimitSnapshot(account),
-            { env, managed: true },
+            {
+              env,
+              managed: true,
+              forceRefresh: options.forceUsage === true,
+            },
           );
           return withManagedIdentity(
             normalizeClaudeSnapshot(
@@ -2366,6 +3061,7 @@ class IntegrationService {
       MANAGED_REFRESH_CONCURRENCY,
       (account) =>
         (!this.managedLoginProcesses.has(account.id) &&
+          !this.managedClaudeLoginStartRequests.has(account.id) &&
           this.cachedSnapshot(`managed:${account.id}`)) ||
         this.refreshManagedIntegration(account.id),
     );
@@ -2400,6 +3096,9 @@ class IntegrationService {
     const login = this.claudeLoginProcess;
     if (!login) return;
     this.claudeLoginProcess = null;
+    this.claudeInteractiveLoginProfiles.delete(
+      login.profileKey ?? this.claudeCredentialRefreshKey(),
+    );
     clearTimeout(login.timer);
     clearTimeout(login.pollTimer);
     login.cancelled = true;
@@ -2423,6 +3122,9 @@ class IntegrationService {
     const login = this.claudeLoginProcess;
     if (!login || login.cancelled) return null;
     this.claudeLoginProcess = null;
+    this.claudeInteractiveLoginProfiles.delete(
+      login.profileKey ?? this.claudeCredentialRefreshKey(),
+    );
     clearTimeout(login.timer);
     clearTimeout(login.pollTimer);
     login.cancelled = true;
@@ -2456,9 +3158,11 @@ class IntegrationService {
         expiresAt: Date.now() + CLAUDE_AUTH_CACHE_MS,
       };
       this.startClaudeSnapshotWatcher();
+      this.clearClaudeProfileTransientState();
       const usage = await this.collectClaudeUsageSnapshot(
         auth,
         this.readClaudeRateLimitSnapshot(),
+        { forceRefresh: true },
       );
       snapshot = normalizeClaudeSnapshot(
         auth,
@@ -2472,7 +3176,45 @@ class IntegrationService {
     return snapshot;
   }
 
-  async startClaudeLogin() {
+  startClaudeLogin(options = {}) {
+    if (this.claudeLoginProcess) {
+      return Promise.resolve(connectingSnapshot("claude"));
+    }
+    if (this.claudeLoginStartRequest) {
+      return this.claudeLoginStartRequest;
+    }
+
+    const profileKey = this.claudeCredentialRefreshKey();
+    this.claudeInteractiveLoginProfiles.add(profileKey);
+    const task = Promise.resolve().then(() =>
+      this._startClaudeLogin(options, profileKey),
+    );
+    const tracked = task.finally(() => {
+      if (this.claudeLoginStartRequest === tracked) {
+        this.claudeLoginStartRequest = null;
+      }
+      if (!this.claudeLoginProcess) {
+        this.claudeInteractiveLoginProfiles.delete(profileKey);
+      }
+    });
+    this.claudeLoginStartRequest = tracked;
+    return tracked;
+  }
+
+  async _startClaudeLogin(options = {}, profileKey) {
+    if (this.claudeLoginProcess) return connectingSnapshot("claude");
+
+    const credentialRefresh = this.claudeCredentialRefreshRequests.get(
+      profileKey,
+    );
+    if (credentialRefresh) {
+      try {
+        await credentialRefresh;
+      } catch {
+        // Interactive sign-in is the recovery path for failed auto-refresh.
+      }
+    }
+    if (this.shuttingDown) return disconnectedSnapshot("claude");
     if (this.claudeLoginProcess) return connectingSnapshot("claude");
 
     const executablePath = resolveClaudeExecutable();
@@ -2483,6 +3225,7 @@ class IntegrationService {
       );
     }
 
+    const initialCredentialVersion = this.claudeCredentialVersion();
     let child;
     try {
       child = spawn(
@@ -2505,6 +3248,9 @@ class IntegrationService {
 
     const login = {
       child,
+      initialCredentialVersion,
+      requiresCredentialChange:
+        options.force === true && Boolean(initialCredentialVersion),
       cancelled: false,
       checking: false,
       closed: false,
@@ -2544,7 +3290,11 @@ class IntegrationService {
       let terminalError = null;
       try {
         const candidate = await this.readClaudeAuth();
-        if (candidate.loggedIn) auth = candidate;
+        const credentialChanged =
+          !login.requiresCredentialChange ||
+          this.claudeCredentialVersion() !==
+            login.initialCredentialVersion;
+        if (candidate.loggedIn && credentialChanged) auth = candidate;
       } catch (error) {
         if (isTerminalClaudeLoginError(error)) terminalError = error;
       } finally {
@@ -2588,6 +3338,9 @@ class IntegrationService {
     const login = this.managedLoginProcesses.get(accountId);
     if (!login) return;
     this.managedLoginProcesses.delete(accountId);
+    if (login.profileKey) {
+      this.claudeInteractiveLoginProfiles.delete(login.profileKey);
+    }
     clearTimeout(login.timer);
     clearTimeout(login.pollTimer);
     login.cancelled = true;
@@ -2610,6 +3363,9 @@ class IntegrationService {
     const login = this.managedLoginProcesses.get(account.id);
     if (!login || login.cancelled) return null;
     this.managedLoginProcesses.delete(account.id);
+    if (login.profileKey) {
+      this.claudeInteractiveLoginProfiles.delete(login.profileKey);
+    }
     clearTimeout(login.timer);
     clearTimeout(login.pollTimer);
     login.cancelled = true;
@@ -2626,17 +3382,60 @@ class IntegrationService {
       this.emitSnapshot(snapshot);
       return snapshot;
     }
-    const snapshot = await this.refreshManagedIntegration(account.id);
+    const env = managedChildEnvironment(
+      account.provider,
+      this.managedProfilePath(account),
+    );
+    if (account.provider === "claude") {
+      this.clearClaudeProfileTransientState({ env });
+    }
+    const snapshot = await this.refreshManagedIntegration(account.id, {
+      forceUsage: true,
+    });
     if (this.findManagedAccountSafe(account.id)) {
       this.emitSnapshot(snapshot);
     }
     return snapshot;
   }
 
-  async startManagedClaudeLogin(account) {
+  startManagedClaudeLogin(account) {
+    if (this.managedLoginProcesses.has(account.id)) {
+      return Promise.resolve(connectingManagedSnapshot(account));
+    }
+    const existingStart = this.managedClaudeLoginStartRequests.get(
+      account.id,
+    );
+    if (existingStart) return existingStart;
+
+    const profileKey = this.claudeCredentialRefreshKey({
+      env: { CLAUDE_CONFIG_DIR: this.managedProfilePath(account) },
+    });
+    this.claudeInteractiveLoginProfiles.add(profileKey);
+    const task = Promise.resolve().then(() =>
+      this._startManagedClaudeLogin(account, profileKey),
+    );
+    const tracked = task.finally(() => {
+      if (
+        this.managedClaudeLoginStartRequests.get(account.id) === tracked
+      ) {
+        this.managedClaudeLoginStartRequests.delete(account.id);
+      }
+      if (!this.managedLoginProcesses.has(account.id)) {
+        this.claudeInteractiveLoginProfiles.delete(profileKey);
+      }
+    });
+    this.managedClaudeLoginStartRequests.set(account.id, tracked);
+    return tracked;
+  }
+
+  async _startManagedClaudeLogin(account, profileKey) {
+    if (this.managedLoginProcesses.has(account.id)) {
+      return connectingManagedSnapshot(account);
+    }
     let executablePath;
     let child;
     let env;
+    let initialCredentialVersion = null;
     try {
       this.ensureManagedClaudeBridge(account);
       executablePath = resolveClaudeExecutable();
@@ -2647,6 +3446,24 @@ class IntegrationService {
         "claude",
         this.managedProfilePath(account),
       );
+      const credentialRefresh =
+        this.claudeCredentialRefreshRequests.get(
+          this.claudeCredentialRefreshKey({ env }),
+        );
+      if (credentialRefresh) {
+        try {
+          await credentialRefresh;
+        } catch {
+          // Interactive sign-in is the recovery path for failed auto-refresh.
+        }
+      }
+      if (this.shuttingDown) {
+        return withManagedIdentity(disconnectedSnapshot("claude"), account);
+      }
+      if (this.managedLoginProcesses.has(account.id)) {
+        return connectingManagedSnapshot(account);
+      }
+      initialCredentialVersion = this.claudeCredentialVersion({ env });
       child = spawn(
         executablePath,
         ["auth", "login", "--claudeai"],
@@ -2667,6 +3484,10 @@ class IntegrationService {
 
     const login = {
       child,
+      profileKey,
+      profileKey,
+      initialCredentialVersion,
+      requiresCredentialChange: Boolean(initialCredentialVersion),
       cancelled: false,
       checking: false,
       closed: false,
@@ -2704,7 +3525,11 @@ class IntegrationService {
       let terminalError = null;
       try {
         const auth = await this.readClaudeAuth({ env });
-        authenticated = auth.loggedIn;
+        const credentialChanged =
+          !login.requiresCredentialChange ||
+          this.claudeCredentialVersion({ env }) !==
+            login.initialCredentialVersion;
+        authenticated = auth.loggedIn && credentialChanged;
       } catch (error) {
         if (isTerminalClaudeLoginError(error)) terminalError = error;
       } finally {
@@ -3171,12 +3996,12 @@ class IntegrationService {
     }
   }
 
-  async refreshManagedIntegrations() {
+  async refreshManagedIntegrations(options = {}) {
     const accounts = this.readManagedAccounts();
     return mapWithConcurrency(
       accounts,
       MANAGED_REFRESH_CONCURRENCY,
-      (account) => this.refreshManagedIntegration(account.id),
+      (account) => this.refreshManagedIntegration(account.id, options),
     );
   }
 
@@ -3193,10 +4018,13 @@ class IntegrationService {
     return this.cacheSnapshot(snapshot);
   }
 
-  async refreshClaude({ requireBridge = true } = {}) {
-    const refreshKey = requireBridge
-      ? "claude-with-bridge"
-      : "claude-auth-only";
+  async refreshClaude({ requireBridge = true, forceUsage = false } = {}) {
+    if (this.claudeLoginProcess || this.claudeLoginStartRequest) {
+      return this.cacheSnapshot(connectingSnapshot("claude"));
+    }
+    const refreshKey = `${
+      requireBridge ? "claude-with-bridge" : "claude-auth-only"
+    }:${forceUsage ? "force" : "cached"}`;
     const snapshot = await this.deduplicateRefresh(refreshKey, async () => {
       try {
         if (requireBridge) {
@@ -3215,6 +4043,7 @@ class IntegrationService {
         const usage = await this.collectClaudeUsageSnapshot(
           auth,
           this.readClaudeRateLimitSnapshot(),
+          { forceRefresh: forceUsage },
         );
         return normalizeClaudeSnapshot(
           auth,
@@ -3228,11 +4057,14 @@ class IntegrationService {
     return this.cacheSnapshot(snapshot);
   }
 
-  async refreshConnectedProvider(provider) {
+  async refreshConnectedProvider(provider, options = {}) {
     if (!PROVIDERS.has(provider)) {
       return errorSnapshot("codex", "error", "INVALID_PROVIDER");
     }
-    if (provider === "claude" && this.claudeLoginProcess) {
+    if (
+      provider === "claude" &&
+      (this.claudeLoginProcess || this.claudeLoginStartRequest)
+    ) {
       return this.cacheSnapshot(connectingSnapshot("claude"));
     }
     if (!this.readConnections()[provider]) {
@@ -3242,7 +4074,9 @@ class IntegrationService {
     const snapshot =
       provider === "codex"
         ? await this.refreshCodex()
-        : await this.refreshClaude();
+        : await this.refreshClaude({
+            forceUsage: options.forceUsage === true,
+          });
 
     // Do not let a refresh that began before disconnect resurrect a card.
     return this.cacheSnapshot(
@@ -3259,7 +4093,10 @@ class IntegrationService {
         if (!connections[provider]) {
           return this.cacheSnapshot(disconnectedSnapshot(provider));
         }
-        if (provider === "claude" && this.claudeLoginProcess) {
+        if (
+          provider === "claude" &&
+          (this.claudeLoginProcess || this.claudeLoginStartRequest)
+        ) {
           return this.refreshConnectedProvider(provider);
         }
         return (
@@ -3292,7 +4129,7 @@ class IntegrationService {
     }
 
     try {
-      if (this.claudeLoginProcess) {
+      if (this.claudeLoginProcess || this.claudeLoginStartRequest) {
         return connectingSnapshot("claude");
       }
       const auth = await this.readClaudeAuth();
@@ -3323,6 +4160,18 @@ class IntegrationService {
     } catch (error) {
       return this.snapshotForError("claude", error);
     }
+  }
+
+  async reauthenticate(provider) {
+    if (provider !== "claude") {
+      return errorSnapshot("codex", "error", "INVALID_PROVIDER");
+    }
+    if (this.claudeLoginProcess || this.claudeLoginStartRequest) {
+      return this.cacheSnapshot(connectingSnapshot("claude"));
+    }
+    return this.cacheSnapshot(
+      await this.startClaudeLogin({ force: true }),
+    );
   }
 
   async disconnect(provider) {
@@ -3366,11 +4215,21 @@ class IntegrationService {
   }
 
   async refresh() {
-    return this.getStatus();
+    const connections = this.readConnections();
+    return Promise.all(
+      ["codex", "claude"].map((provider) =>
+        connections[provider]
+          ? this.refreshConnectedProvider(provider, {
+              forceUsage: true,
+            })
+          : this.cacheSnapshot(disconnectedSnapshot(provider)),
+      ),
+    );
   }
 
   shutdown() {
     this.shuttingDown = true;
+    this.stopClaudeCredentialMaintenance();
     this.stopClaudeLogin();
     this.stopClaudeSnapshotWatcher();
     this.stopManagedSnapshotWatcher();
@@ -3378,12 +4237,27 @@ class IntegrationService {
       this.stopManagedLogin(accountId);
     }
     for (const child of this.activeChildren) terminateProcessTree(child);
+    for (const request of this.claudeUsageHttpRequests) {
+      try {
+        request.destroy();
+      } catch {
+        // The request may already be closing.
+      }
+    }
+    this.claudeUsageHttpRequests.clear();
     this.activeChildren.clear();
     this.managedOpenProcesses.clear();
     this.refreshesInFlight.clear();
     this.snapshotCache.clear();
     this.claudeUsageCache.clear();
     this.claudeUsageRequests.clear();
+    this.claudeCredentialRefreshRequests.clear();
+    this.claudeCredentialRefreshBackoff.clear();
+    this.claudeUsageBackoff.clear();
+    this.claudeInteractiveLoginProfiles.clear();
+    this.managedClaudeLoginStartRequests.clear();
+    this.claudeLoginStartRequest = null;
+    this.claudeCredentialMaintenanceRequest = null;
     this.claudeTranscriptCache.clear();
     this.globalClaudeAuthCache = null;
     this.globalClaudeAuthRequest = null;
@@ -3404,11 +4278,14 @@ function registerIntegrationIpc(
   ipcMain.handle("integrations:connect", (_event, provider) =>
     service.connect(provider),
   );
+  ipcMain.handle("integrations:reauthenticate", (_event, provider) =>
+    service.reauthenticate(provider),
+  );
   ipcMain.handle("integrations:disconnect", (_event, provider) =>
     service.disconnect(provider),
   );
   ipcMain.handle("integrations:refresh-provider", (_event, provider) =>
-    service.refreshConnectedProvider(provider),
+    service.refreshConnectedProvider(provider, { forceUsage: true }),
   );
   ipcMain.handle("integrations:refresh", () => service.refresh());
   ipcMain.handle("managed-integrations:get-status", () =>
@@ -3431,10 +4308,10 @@ function registerIntegrationIpc(
   ipcMain.handle(
     "managed-integrations:refresh-account",
     (_event, accountId) =>
-      service.refreshManagedIntegration(accountId),
+      service.refreshManagedIntegration(accountId, { forceUsage: true }),
   );
   ipcMain.handle("managed-integrations:refresh", () =>
-    service.refreshManagedIntegrations(),
+    service.refreshManagedIntegrations({ forceUsage: true }),
   );
   return service;
 }

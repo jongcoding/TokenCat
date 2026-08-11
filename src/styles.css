@@ -1177,6 +1177,20 @@ label:has(input:focus-visible) {
   border-color: color-mix(in srgb, var(--warning) 45%, var(--line));
 }
 
+.live-account-message__action {
+  justify-self: start;
+  min-height: 26px;
+  padding: 4px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
 .account-stats {
   min-width: 0;
   display: flex;
